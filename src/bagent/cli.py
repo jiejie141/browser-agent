@@ -214,7 +214,8 @@ def main(argv: list[str] | None = None) -> int:
             failures = 0
             for item in tasks:
                 code = await run_one(
-                    item["task"], item["url"], args.max_steps, settings
+                    item["task"], item["url"], args.max_steps, settings,
+                    mock=args.mock,
                 )
                 failures += 0 if code == 0 else 1
             console.print(f"\n[bold]共 {len(tasks)} 个任务，失败 {failures} 个[/bold]")
