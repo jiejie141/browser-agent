@@ -1,0 +1,97 @@
+name: browser-agent
+
+# 全流程 CI：测试 → 双引擎等价性校验 → 引擎对比。
+# 全程走 --mock（离线替身），不需要 API Key、不烧 token、结果可复现。
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 单元测试与引擎校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 装依赖 + 浏览器。langgraph 是为了让 graph_agent 的用例真跑起来。
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install langgraph langchain-core fastapi uvicorn httpx
+
+      - name: 安装 Chromium
+        run: playwright install --with-deps chromium
+
+      - name: 代码可编译性检查
+        run: python -m compileall -q src main.py eval
+
+      - name: 运行测试
+        run: python -m pytest tests -q
+
+      - name: 环境自检（离线替身）
+        run: python main.py --doctor --mock
+
+      # 同一任务分别用两个引擎跑，输出应完全等价。
+      # 这是「手写循环」与「框架版」等价性的守门测试。
+      - name: 双引擎冒烟（handwritten）
+        run: |
+          python main.py --task "读出页面标题" \
+            --url "https://example.com" --mock --engine handwritten
+
+      - name: 双引擎冒烟（langgraph）
+        run: |
+          python main.py --task "读出页面标题" \
+            --url "https://example.com" --mock --engine langgraph
+
+      - name: 引擎对比
+        run: python eval/compare_engines.py
+
+      - name: 上传运行产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runs
+          path: runs/
+          if-no-files-found: ignore
+
+  docker:
+    name: 镜像可构建性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建镜像
+        run: docker build -t browser-agent:ci .
+
+      # 镜像起来后必须能响应 /health，否则算失败
+      - name: 启动并探活
+        run: |
+          docker run -d --name ba -p 8000:8000 \
+            browser-agent:ci \
+            -m uvicorn bagent.api:app --host 0.0.0.0 --port 8000
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health > /dev/null; then
+              echo "health OK"; break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health
+          docker logs ba
+
+      - name: 清理
+        if: always()
+        run: docker rm -f ba || true

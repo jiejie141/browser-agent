@@ -65,6 +65,12 @@ class Settings:
     headless: bool = field(default_factory=lambda: _get_bool("HEADLESS", False))
     log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "INFO").upper())
 
+    # ---- Agent 引擎 ----
+    # handwritten：agent.py 里的手写 ReAct 循环（默认，零额外依赖）
+    # langgraph：graph_agent.py 里的 LangGraph StateGraph 实现
+    # 两者共用同一套 perceive / 动作层 / 提示词，可用同一份评测集做 A/B 对比
+    engine: str = field(default_factory=lambda: _get("ENGINE", "handwritten").lower())
+
     # ---- 目录 ----
     runs_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "runs")
     tasks_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "tasks")

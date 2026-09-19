@@ -19,9 +19,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .agent import ReActAgent, new_run_dir
+from .agent import new_run_dir
 from .browser import open_browser
 from .config import get_settings
+from .graph_agent import build_agent
 from .llm import LLMError, MockLLMClient, build_client
 from .models import Action
 
@@ -87,13 +88,15 @@ def _print_summary(result) -> None:
 
 async def run_one(task: str, url: str, max_steps: int | None, settings, mock: bool = False) -> int:
     run_dir = new_run_dir(settings, tag="task")
+    engine = (getattr(settings, "engine", "handwritten") or "handwritten").lower()
     title = "[bold]%s[/bold]" % task
+    title += f"\n[dim]引擎: {engine}[/dim]"
     if mock:
         title += "\n[yellow]MOCK 模式：不调用真实模型，按剧本执行[/yellow]"
     console.print(Panel(title + f"\n[dim]起始页: {url}[/dim]", border_style="cyan"))
 
     llm = MockLLMClient() if mock else build_client(settings)
-    agent = ReActAgent(settings, llm=llm, on_step=_print_step)
+    agent = build_agent(settings, llm=llm, on_step=_print_step)
 
     async with open_browser(settings, run_dir) as session:
         result = await agent.run(
@@ -117,6 +120,17 @@ def doctor(settings) -> int:
     checks.append(("Python", True, sys.version.split()[0]))
     checks.append(("工作目录", True, str(Path.cwd())))
     checks.append(("配置读取", bool(settings.llm_api_key), settings.llm_model))
+    engine = (getattr(settings, "engine", "handwritten") or "handwritten").lower()
+    checks.append(("Agent 引擎", True, engine))
+    if engine == "langgraph":
+        try:
+            import langgraph  # noqa: F401
+
+            checks.append(("LangGraph", True, "已安装"))
+        except ImportError:
+            checks.append(
+                ("LangGraph", False, "未安装：pip install langgraph（或改用 --engine handwritten）")
+            )
     checks.append(
         ("视觉通道", settings.vlm_enabled, "已启用" if settings.vlm_enabled else "未配置（将只走 DOM 通道）")
     )
@@ -181,11 +195,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="离线模式：用剧本替身代替真实模型，不需要 key，用于验证主循环",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["handwritten", "langgraph"],
+        help="Agent 引擎：handwritten（默认，零额外依赖的手写 ReAct 循环）"
+        " / langgraph（LangGraph StateGraph 实现）",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings(refresh=True)
     if args.headful:
         settings.headless = False
+    if args.engine:
+        settings.engine = args.engine
     setup_logging(settings.log_level)
 
     if args.doctor:

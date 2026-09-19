@@ -1,0 +1,30 @@
+# 版本控制与 IDE
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Python 产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地状态：绝不进镜像
+# runs/ 里是每次执行的 trace、截图、harness 记录 —— 属于运行产物，
+# 而且可能含抓取到的页面内容（有隐私风险），必须排除。
+runs/
+.env
+.env.local
+*.log
+
+# 开发辅助
+docs/
+eval/
+scripts/
+tests/

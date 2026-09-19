@@ -73,6 +73,14 @@ SYSTEM_PROMPT = """你是一个浏览器自动化 Agent。你的目标是通过�
 """
 
 
+# 熔断阈值。**提升为模块级常量**，因为 LangGraph 引擎（graph_agent.py）
+# 必须用同一套阈值 —— 否则两个引擎的"什么时候停"不一致，A/B 对比就失去意义。
+# 原先这三个值是写在 run() 里的局部变量，跨引擎无法共享，属于隐性耦合。
+LOOP_WARN_AT = 3   # 第 3 次重复同一个动作 → 注入强警告
+LOOP_STOP_AT = 5   # 第 5 次 → 直接熔断，不再烧钱
+MAX_CONSECUTIVE_FAILURES = 3
+
+
 def _action_signature(action: Action) -> str:
     """动作指纹：用来识别"原地打转"。
 
@@ -143,8 +151,6 @@ class ReActAgent:
         # 只靠 consecutive_failures 抓不到循环——循环里每一步都是"成功"的，
         # 只是毫无进展。这是 7B 级别模型最典型的失效方式。
         sig_trail: list[str] = []
-        LOOP_WARN_AT = 3   # 第 3 次重复同一个动作 → 注入强警告
-        LOOP_STOP_AT = 5   # 第 5 次 → 直接熔断，不再烧钱
 
         for step in range(1, max_steps + 1):
             # ---------- 看（Observe）----------
@@ -225,7 +231,7 @@ class ReActAgent:
             history = history[-12:]  # 只保留最近 12 步，控制 prompt 长度
 
             consecutive_failures = 0 if outcome_ok else consecutive_failures + 1
-            if consecutive_failures >= 3:
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 error = "连续 3 步失败，已熔断"
                 break
 

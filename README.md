@@ -181,3 +181,90 @@ token        输入 8432 / 输出 1105 / 共 9537
 
 这些不是借口，是**待办清单**——也是你面试时可以主动讲的部分：
 "我知道它在哪些情况下会失效，因为我都测过。"
+
+---
+
+## 双引擎：手写 ReAct 与 LangGraph（新增）
+
+主循环有两个可互换的实现，用 `--engine` 切换：
+
+```powershell
+# 手写循环（默认，零额外依赖）
+.\.venv\Scripts\python.exe main.py --task "读出页面标题" --url "https://example.com" --engine handwritten
+
+# LangGraph 状态图（需 pip install langgraph langchain-core）
+.\.venv\Scripts\python.exe main.py --task "读出页面标题" --url "https://example.com" --engine langgraph
+```
+
+### 为什么要两个都留着
+
+**手写版**证明我理解循环本身：何时重试、何时熔断、怎么打断死循环。
+**LangGraph 版**证明我会用主流框架，并且知道它在什么场景下值得引入。
+
+两版共用同一套节点逻辑与终止条件，**A/B 实测完全等价**（mock 模式、同一任务）：
+
+| | handwritten | langgraph |
+|---|---|---|
+| 步数 | 4 | 4 |
+| 输入 token | 5300 | 5300 |
+| 输出 token | 275 | 275 |
+| 模型调用 | 5 | 5 |
+| 成本 | ¥0.005850 | ¥0.005850 |
+
+### 设计要点：终止条件抽成纯函数
+
+`graph_agent.py` 里路由是纯函数，不依赖框架运行时，所以**状态机是可单测对象**：
+
+```python
+def route_after_act(state) -> Literal["perceive", "end"]:
+    if state.get("finished") or state.get("error"):
+        return "end"
+    if state.get("step", 0) >= state.get("max_steps", 0):
+        return "end"
+    if state.get("consecutive_failures", 0) >= MAX_CONSECUTIVE_FAILURES:
+        return "end"
+    return "perceive"
+```
+
+> 踩过的坑：**LangGraph 只会传递 `TypedDict` 里声明过的 key**。
+> 一开始我用 `_state` 这种下划线开头的键存页面状态，结果节点之间静默丢失，
+> 报 `AttributeError: 'NoneType' object has no attribute 'render_for_prompt'`。
+> 必须在 `AgentState` 里显式声明。
+
+---
+
+## 服务化：FastAPI（新增）
+
+```powershell
+pip install fastapi uvicorn
+uvicorn bagent.api:app --reload --port 8000
+```
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | 健康检查（含 LangGraph 可用性） |
+| GET | `/engines` | 可用引擎 |
+| POST | `/tasks` | 提交任务，返回 **202 + task_id**（异步执行） |
+| GET | `/tasks/{task_id}` | 查询任务状态与结果 |
+| GET | `/tasks` | 列出最近任务 |
+
+任务用 `BackgroundTasks` 异步跑，进程内保存最近 200 条。
+因为启动浏览器是重操作，同步接口会让 HTTP 请求挂住几十秒。
+
+---
+
+## 容器化（新增）
+
+```bash
+docker build -t browser-agent .
+docker run --shm-size=1g -p 8000:8000 browser-agent -m uvicorn bagent.api:app --host 0.0.0.0
+```
+
+**必须给 `--shm-size`**：Chromium 在容器里常因 `/dev/shm` 太小而随机崩溃
+（典型报错 `Target closed` / `Page crashed`），默认 64MB 不够。
+
+基础镜像用 Playwright 官方的 `mcr.microsoft.com/playwright/python`，它已装好 Chromium
+和全部系统依赖；自己从头 `apt install` 既慢又容易漏库（缺 `libnss3` / `libatk` 时报错很
+不直观）。容器内默认 `HEADLESS=true MOCK=true OFFLINE=true`。
+
+配合仓库根目录的 `docker-compose.yml` 可与 pr-review-agent 一起编排。
