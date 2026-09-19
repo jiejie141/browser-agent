@@ -268,3 +268,15 @@ docker run --shm-size=1g -p 8000:8000 browser-agent -m uvicorn bagent.api:app --
 不直观）。容器内默认 `HEADLESS=true MOCK=true OFFLINE=true`。
 
 配合仓库根目录的 `docker-compose.yml` 可与 pr-review-agent 一起编排。
+
+### 构建踩过的两个坑
+
+1. **`.dockerignore` 排除了 `docs/`，而 Dockerfile 里又 `COPY docs/ ./docs/`** —— 构建会直接
+   报 `not found`。`docs/` 放的是实验记录和教程，属于要进镜像的内容，不能忽略。
+   排查方式：把 Dockerfile 里每条 `COPY` 的源路径与 `.dockerignore` 的规则对一遍，
+   凡是「既存在又被忽略」的就是雷。
+2. **`doctor()` 把「视觉通道未配置」判为失败。** 视觉是 DOM 通道失效时的**可选**降级路径，
+   没配 key 就自动退回纯 DOM，这是设计行为而不是故障。原来它返回 `settings.vlm_enabled`，
+   导致容器里（`MOCK/OFFLINE`）自检退出码恒为 1。现已改为：配了才算一项检查，
+   没配则如实说明「按设计只走 DOM 通道」；同时在 `MOCK/OFFLINE` 下跳过模型连通性检查，
+   不在离线环境里发起真实网络请求。
