@@ -243,8 +243,23 @@ class LangGraphReActAgent:
         action: Action | None = state.get("action")
         if action is None:
             # reason 节点没能解析出动作（已写入 consecutive_failures / history）。
-            # 这里不重复计数，也不动浏览器，直接回到 perceive 让它再试。
-            return {}
+            # 这一轮**真的花了一次模型调用**，所以必须补一条记录 —— 否则
+            # records 里的 step 会跳号（和 ReActAgent 里犯过的是同一个错），
+            # 前端时间线看起来像"某一步凭空消失"，而那恰恰是排障最需要的一步。
+            records.append(
+                StepRecord(
+                    step=step,
+                    action=None,
+                    raw_action="(格式错误)",
+                    ok=False,
+                    message="模型输出不是合法 JSON",
+                    url_after=(state.get("page_state").url
+                               if state.get("page_state") else ""),
+                ).model_dump()
+            )
+            if self.on_step:
+                self.on_step(step, None, False, "输出格式不合法")
+            return {"records": records}
 
         st = state.get("page_state")
 
@@ -368,6 +383,8 @@ class LangGraphReActAgent:
         records = [StepRecord(**r) for r in (final.get("records") or [])]
         elapsed = time.time() - started
         usage: Usage = self.llm.usage
+        # 与 ReActAgent 保持同一口径：离线替身没有真实计费，成本恒为 0。
+        offline = bool(getattr(self.settings, "mock", False))
         result = RunResult(
             task=task,
             start_url=start_url,
@@ -377,12 +394,13 @@ class LangGraphReActAgent:
             steps=len(records),
             elapsed_seconds=round(elapsed, 2),
             usage=usage,
-            cost_yuan=round(
+            cost_yuan=0.0 if offline else round(
                 usage.cost_yuan(
                     self.settings.price_in_per_mtok, self.settings.price_out_per_mtok
                 ),
                 6,
             ),
+            offline=offline,
             records=records,
             run_dir=str(run_dir),
             error=error,

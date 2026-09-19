@@ -35,9 +35,11 @@ import logging
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .agent import new_run_dir
@@ -96,15 +98,40 @@ class TaskStatus(BaseModel):
     finished_at: str | None = None
     task: str
     url: str
+    # 是否离线替身跑出来的。必须在任务状态里回传：
+    # 离线模式下的 token 是估算值、成本实际为 0，前端要据此标注口径，
+    # 否则会把"估算的 token × 单价"当成真实花费展示出来。
+    mock: bool = False
     success: bool | None = None
     answer: str = ""
     steps: int = 0
     elapsed_seconds: float = 0.0
     total_tokens: int = 0
     cost_yuan: float = 0.0
+    # 离线替身：token 是估算值、cost_yuan 恒为 0。前端据此标注口径。
+    offline: bool = False
     error: str = ""
     records: list[StepOut] = Field(default_factory=list)
     run_dir: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 控制台页面
+#
+# 用 FileResponse 直接吐一个静态 HTML，不引模板引擎、不挂 StaticFiles：
+# 页面只有一个文件、没有构建链，用 jinja2 或给静态目录配路由都是多余的间接层。
+# 放在包内（src/bagent/web/）而不是仓库根，是为了让它在 `pip install` 后
+# 依然能找到 —— 路径基于 __file__ 推导，不依赖当前工作目录。
+# ---------------------------------------------------------------------------
+_WEB_INDEX = Path(__file__).resolve().parent / "web" / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+def console() -> FileResponse:
+    """返回控制台页面。"""
+    if not _WEB_INDEX.is_file():
+        raise HTTPException(404, "控制台页面缺失：src/bagent/web/index.html")
+    return FileResponse(_WEB_INDEX, media_type="text/html; charset=utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +185,7 @@ def create_task(req: TaskRequest, bg: BackgroundTasks) -> TaskCreated:
         "finished_at": None,
         "task": req.task,
         "url": req.url,
+        "mock": req.mock,
         "success": None,
         "answer": "",
         "steps": 0,
@@ -192,6 +220,11 @@ def list_tasks(limit: int = 20) -> dict[str, Any]:
                 "task_id": i["task_id"], "status": i["status"],
                 "engine": i["engine"], "task": i["task"][:60],
                 "success": i["success"], "created_at": i["created_at"],
+                # 列表页也要给出步数与耗时：前端表格要显示这两列，
+                # 只返回 id/status 会逼客户端对每条再打一次详情接口（N+1 请求）。
+                # 列表里这两项本来就是现成的，顺手带上没有任何额外成本。
+                "steps": i.get("steps", 0),
+                "elapsed_seconds": i.get("elapsed_seconds", 0.0),
             }
             for i in items
         ],
@@ -206,8 +239,14 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
     t["status"] = "running"
     st = get_settings(refresh=True)
     st.engine = engine
+    # 必须把请求级的 mock 写回 settings：下面选 LLM 客户端靠的是 req.mock，
+    # 但 Agent 判定"要不要计费"读的是 settings.mock。两者不同步时，
+    # 离线任务会照常乘单价算出个假成本（实测 ¥0.00347），
+    # 而界面上又标着"不花钱" —— 一个开关两处读，迟早对不上。
+    st.mock = bool(req.mock)
 
     try:
+        t["offline"] = bool(req.mock)
         llm = MockLLMClient() if req.mock else build_client(st)
         run_dir = new_run_dir(st, tag=f"api-{engine}")
         agent = build_agent(st, llm=llm)
@@ -230,11 +269,15 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             "elapsed_seconds": result.elapsed_seconds,
             "total_tokens": result.usage.total_tokens,
             "cost_yuan": result.cost_yuan,
+            "offline": result.offline,
             "error": result.error,
             "run_dir": result.run_dir,
             "records": [
+                # 用 action_name 而不是 r.action.action：格式错误那一步没有
+                # 可执行的 Action，直接取属性会 AttributeError 打挂整个序列化，
+                # 结果是"任务其实跑完了，但详情接口 500"。
                 StepOut(
-                    step=r.step, action=r.action.action, ok=r.ok,
+                    step=r.step, action=r.action_name, ok=r.ok,
                     message=r.message, url_after=r.url_after,
                 ).model_dump()
                 for r in result.records

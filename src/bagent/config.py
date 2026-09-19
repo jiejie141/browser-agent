@@ -71,6 +71,13 @@ class Settings:
     # 两者共用同一套 perceive / 动作层 / 提示词，可用同一份评测集做 A/B 对比
     engine: str = field(default_factory=lambda: _get("ENGINE", "handwritten").lower())
 
+    # ---- 离线替身 ----
+    # True 表示本次运行不调用真实模型：Agent 据此把成本计为 0
+    # （离线替身的 token 是按字符估的，乘单价会算出一个并不存在的花费）。
+    # 注意它属于"运行期状态"而不只是启动配置：API 每次任务都会按请求覆写它，
+    # 所以必须在 Settings 上真的存在，光靠 _get("MOCK") 读环境变量是不够的。
+    mock: bool = field(default_factory=lambda: _get_bool("MOCK", False))
+
     # ---- 目录 ----
     runs_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "runs")
     tasks_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "tasks")

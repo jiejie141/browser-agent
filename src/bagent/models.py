@@ -110,11 +110,26 @@ class StepRecord(BaseModel):
     """一步的完整记录，落盘后可用于复盘和评测。"""
 
     step: int
-    action: Action
-    ok: bool
-    message: str
+    # 契约上允许出现"非动作"的一步：模型输出不是合法 JSON 时，那一轮
+    # 也是真实消耗了一次调用的，必须留下痕迹。为了给这种情况一个合法的
+    # 容器，这里放宽成 `Action | None`，并把原始动作名放在 `raw_action`。
+    #
+    # 反过来做（造一个 action="(格式错误)" 的假 Action）是行不通的：
+    # ActionName 是封闭字面量类型，pydantic 会在构造时直接抛
+    # ValidationError —— 那等于"为了记录一个格式错误，先让程序崩掉"。
+    action: Action | None = None
+    raw_action: str = ""
+    ok: bool = False
+    message: str = ""
     url_after: str = ""
     screenshot_path: str = ""
+
+    @property
+    def action_name(self) -> str:
+        """给渲染/报表用的动作名，真实动作优先，其次原始字符串。"""
+        if self.action is not None:
+            return self.action.action
+        return self.raw_action or "-"
 
 
 class StepOutcome(BaseModel):

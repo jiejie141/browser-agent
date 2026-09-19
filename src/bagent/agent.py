@@ -107,12 +107,17 @@ class RunResult:
     elapsed_seconds: float
     usage: Usage
     cost_yuan: float
+    # 这次是不是离线替身跑的。与 cost_yuan 一起构成"花钱口径"：
+    # offline=True 时 usage 里的 token 只是估算值、cost_yuan 恒为 0。
+    offline: bool = False
     records: list[StepRecord] = field(default_factory=list)
     run_dir: str = ""
     error: str = ""
 
 
-StepCallback = Callable[[int, Action, bool, str], None]
+# action 可以是 None：模型输出不是合法 JSON 的那一步没有可执行的 Action，
+# 但它仍是一次真实的模型调用，回调必须能把它报出来（否则前端时间线会缺号）。
+StepCallback = Callable[[int, "Action | None", bool, str], None]
 
 
 class ReActAgent:
@@ -184,6 +189,28 @@ class ReActAgent:
                 # 模型吐了不合法的 JSON。把它当成一次失败反馈回去，而不是直接崩。
                 consecutive_failures += 1
                 history.append(f"第 {step} 步: 输出格式不合法（{parse_err}），请只输出合法 JSON")
+                # 这一轮**确实消耗了一次模型调用**，必须留下记录。
+                # 原来这里直接 continue 不 append，导致 records 里的 step 编号跳号
+                # （实测 [1,3,4,5]），审计轨迹看起来像"漏了第 2 步"，
+                # 实际是那一步的失败被整个吞掉了 —— 排障时最不该丢的就是失败那一步。
+                #
+                # 注意不能给 action 塞一个编造的动作名：ActionName 是封闭字面量，
+                # 构造时就会 ValidationError（踩过）。用 raw_action 承载原始字符串。
+                records.append(
+                    StepRecord(
+                        step=step,
+                        action=None,
+                        raw_action="(格式错误)",
+                        ok=False,
+                        message=f"模型输出不是合法 JSON：{parse_err}",
+                        url_after=state.url,
+                        screenshot_path=state.screenshot_path,
+                    )
+                )
+                if self.on_step:
+                    # 回调签名要 Action，这里没有合法 Action 可传；用 None 表示
+                    # "这一步没有动作"，让订阅方自己决定怎么展示。
+                    self.on_step(step, None, False, f"输出格式不合法：{parse_err}")
                 if consecutive_failures >= 3:
                     error = f"模型连续输出非法格式: {parse_err}"
                     break
@@ -256,6 +283,10 @@ class ReActAgent:
 
         elapsed = time.time() - started
         usage = self.llm.usage
+        # 离线替身没有真实计费：它的 token 是按字符估出来的。若照常乘单价，
+        # 会凭空算出一个"成本"（实测离线跑一次显示 ¥0.00347），
+        # 使用者会以为这次真的花了钱 —— 离线模式的成本必须是 0。
+        offline = bool(getattr(self.settings, "mock", False))
         result = RunResult(
             task=task,
             start_url=start_url,
@@ -265,12 +296,13 @@ class ReActAgent:
             steps=len(records),
             elapsed_seconds=round(elapsed, 2),
             usage=usage,
-            cost_yuan=round(
+            cost_yuan=0.0 if offline else round(
                 usage.cost_yuan(
                     self.settings.price_in_per_mtok, self.settings.price_out_per_mtok
                 ),
                 6,
             ),
+            offline=offline,
             records=records,
             run_dir=str(run_dir),
             error=error,

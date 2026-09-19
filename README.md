@@ -280,3 +280,64 @@ docker run --shm-size=1g -p 8000:8000 browser-agent -m uvicorn bagent.api:app --
    导致容器里（`MOCK/OFFLINE`）自检退出码恒为 1。现已改为：配了才算一项检查，
    没配则如实说明「按设计只走 DOM 通道」；同时在 `MOCK/OFFLINE` 下跳过模型连通性检查，
    不在离线环境里发起真实网络请求。
+
+---
+
+## Web 控制台
+
+服务启动后直接打开 <http://127.0.0.1:8000/> 就是一个自带的可视控制台
+（深色主题，零前端依赖、无构建步骤）：
+
+- 提交任务、选引擎 / 最大步数 / 离线开关，页面上直接看执行时间线；
+- 每一步显示动作名、说明与所在网址，失败步用红色标出来；
+- 下方「最近任务」表格列出最近 20 条，含步数与耗时。
+
+实现方式刻意做到最简：`src/bagent/web/index.html` 是**单文件**页面，
+用 `FileResponse` 直接从包内路径吐出去 ——
+
+```python
+_WEB_INDEX = Path(__file__).resolve().parent / "web" / "index.html"
+
+@app.get("/", include_in_schema=False)
+def console() -> FileResponse:
+    ...
+    return FileResponse(_WEB_INDEX, media_type="text/html; charset=utf-8")
+```
+
+几个取舍值得说明：
+
+- **用 `Path(__file__)` 而不是相对 cwd 的路径**：静态页放在包内部，
+  `pip install` 后依然找得到，也不受启动目录影响。
+- **`include_in_schema=False`**：`/` 是给人看的页面，不是 API，
+  放进 OpenAPI 只会让文档里多一条没有意义的接口。
+- **页面自证可用**：`tests/test_api.py` 里断言 `/` 返回 `text/html` 且包含
+  `id="task"` / `id="go"` 等锚点。一旦 Dockerfile 或打包清单漏掉 `web/` 目录，
+  测试会立刻红，而不是等线上打开发现 404。
+
+### 控制台暴露出来的三个真实缺陷
+
+把后端接到一个真实界面上之后，原先"接口能返回 200 就算对"的地方全部露了馅。
+这三处都是**后端逻辑问题**（不是渲染问题），控制台只是让它们变得可见：
+
+1. **离线任务的成本是凭空算出来的。** 离线替身的 token 是按字符估算的，
+   而 `cost_yuan` 照常乘以单价，于是离线跑一次会显示 `¥0.00347` ——
+   使用者会以为这次真的花了钱。更根本的问题是同一件事有两个开关：
+   选 LLM 客户端读 `req.mock`，判定是否计费读 `settings.mock`，而
+   **`Settings` 上当时根本没有 `mock` 这个字段**，`st.mock = True` 是一句无声的空操作。
+   现已在 `Settings` 上真正定义 `mock`，并由 `_run_task` 按请求覆写，
+   `RunResult.offline` 把口径一路带到界面（显示 `¥0 / 成本（离线，未产生费用）`）。
+2. **`records` 里的步号会跳号**（实测 `[1, 3, 4, 5]`）。模型输出不是合法 JSON 时，
+   那一轮**确实消耗了一次模型调用**，但代码直接 `continue`，没有留下 `StepRecord`。
+   审计轨迹看起来像"漏了第 2 步"，其实那一步的失败被整个吞掉了 ——
+   排障时最不该丢的恰恰是失败那一步。
+   修的时候踩到一个坑：不能给 `action` 塞一个编造的 `"(格式错误)"`，
+   因为 `ActionName` 是封闭字面量，pydantic 会在构造时直接 `ValidationError`
+   （等于"为了记录一个格式错误，先让程序崩掉"）。
+   正确做法是 `StepRecord.action` 放宽为 `Action | None`，另加 `raw_action` 承载原始字符串。
+3. **列表接口不返回 `steps` / `elapsed_seconds`**，导致前端表格这两列只能显示 `-`，
+   除非客户端对每一行再打一次详情接口（20 行 = 21 个请求）。这两项在列表数据里本来就是现成的。
+
+前两条都补了回归测试，断言的是**语义**而不是返回值：
+`test_offline_task_reports_zero_cost` 要求离线任务 `cost_yuan == 0`，
+`test_step_record_accepts_error_step` 要求"格式错误"这一步能落盘且能序列化。
+

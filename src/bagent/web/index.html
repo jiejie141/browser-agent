@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browser-agent · 控制台</title>
+<style>
+/* ------------------------------------------------------------------
+   深色科技感主题
+   配色：近黑底 + 电光青(#22d3ee) / 蓝紫(#7c8cff) 双强调 + 琥珀警示
+   所有颜色集中在 :root，改主题只动这里
+------------------------------------------------------------------ */
+:root{
+  --bg:#080b12;          /* 页面底 */
+  --panel:#0e131d;       /* 卡片 */
+  --panel-2:#131a26;     /* 次级面 */
+  --line:#1e2836;        /* 分隔线 */
+  --line-2:#2a3648;      /* 强分隔线 */
+  --fg:#e6edf7;          /* 主文字 */
+  --fg-2:#93a1b8;        /* 次级文字 */
+  --fg-3:#5d6b82;        /* 弱文字 */
+  --cyan:#22d3ee;        /* 主强调 */
+  --violet:#7c8cff;      /* 副强调 */
+  --amber:#fbbf24;       /* 进行中 */
+  --green:#34d399;       /* 成功 */
+  --red:#f87171;         /* 失败 */
+  --glow:0 0 0 1px rgba(34,211,238,.25), 0 0 24px -6px rgba(34,211,238,.45);
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg); font-family:var(--sans);
+  font-size:14px; line-height:1.6; -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+}
+/* 背景网格 + 顶部光晕，营造"科技感"但不喧宾夺主 */
+body::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    radial-gradient(900px 420px at 12% -8%, rgba(34,211,238,.10), transparent 62%),
+    radial-gradient(760px 380px at 92% -4%, rgba(124,140,255,.10), transparent 60%),
+    linear-gradient(rgba(255,255,255,.017) 1px, transparent 1px) 0 0/100% 34px,
+    linear-gradient(90deg, rgba(255,255,255,.017) 1px, transparent 1px) 0 0/34px 100%;
+}
+.wrap{position:relative; z-index:1; max-width:1220px; margin:0 auto; padding:26px 22px 64px}
+
+/* ---------- 顶栏 ---------- */
+header{display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:22px}
+.logo{
+  width:34px;height:34px;border-radius:9px;flex:none;
+  background:linear-gradient(140deg,var(--cyan),var(--violet));
+  display:grid;place-items:center; color:#06121a; font-weight:800; font-size:16px;
+  box-shadow:0 0 22px -4px rgba(34,211,238,.6);
+}
+h1{font-size:18px; margin:0; letter-spacing:.2px}
+h1 small{display:block; font-size:11.5px; color:var(--fg-3); font-weight:400; letter-spacing:.6px}
+.spacer{flex:1}
+.pill{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:4px 10px; border-radius:999px; font-size:11.5px;
+  border:1px solid var(--line-2); color:var(--fg-2); background:var(--panel);
+  font-family:var(--mono);
+}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--fg-3);flex:none}
+.dot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
+.dot.bad{background:var(--red);box-shadow:0 0 8px var(--red)}
+.dot.warn{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+
+/* ---------- 卡片 ---------- */
+.card{
+  background:linear-gradient(180deg,rgba(255,255,255,.022),rgba(255,255,255,0)) , var(--panel);
+  border:1px solid var(--line); border-radius:14px; padding:18px 18px 16px;
+}
+.card + .card{margin-top:16px}
+.card h2{
+  font-size:12px; margin:0 0 14px; letter-spacing:1.3px; text-transform:uppercase;
+  color:var(--fg-3); font-weight:600; display:flex; align-items:center; gap:9px;
+}
+.card h2::before{
+  content:""; width:3px; height:12px; border-radius:2px;
+  background:linear-gradient(180deg,var(--cyan),var(--violet));
+}
+
+/* ---------- 表单一 ---------- */
+.grid{display:grid; grid-template-columns:1fr 300px; gap:14px}
+@media(max-width:860px){.grid{grid-template-columns:1fr}}
+label{display:block; font-size:11.5px; color:var(--fg-3); margin:0 0 6px; letter-spacing:.4px}
+input,textarea,select,button{font-family:inherit; font-size:13px}
+input[type=text],textarea,select{
+  width:100%; background:#0a0f17; color:var(--fg);
+  border:1px solid var(--line-2); border-radius:9px; padding:10px 12px;
+  outline:none; transition:border-color .15s, box-shadow .15s;
+}
+input[type=text]:focus,textarea:focus,select:focus{
+  border-color:var(--cyan); box-shadow:var(--glow);
+}
+textarea{resize:vertical; min-height:76px; line-height:1.55}
+.row{display:flex; gap:12px; flex-wrap:wrap}
+.row > .f{flex:1; min-width:150px}
+.f{margin-bottom:13px}
+.hint{font-size:11px; color:var(--fg-3); margin-top:5px}
+.btn{
+  border:1px solid transparent; border-radius:9px; padding:10px 18px;
+  font-weight:600; cursor:pointer; transition:.15s; letter-spacing:.3px;
+}
+.btn-primary{
+  background:linear-gradient(135deg,var(--cyan),var(--violet)); color:#06121a;
+  box-shadow:0 4px 20px -6px rgba(34,211,238,.7);
+}
+.btn-primary:hover{filter:brightness(1.1); transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.45; cursor:not-allowed; transform:none; filter:none}
+.btn-ghost{background:transparent; border-color:var(--line-2); color:var(--fg-2)}
+.btn-ghost:hover{border-color:var(--cyan); color:var(--cyan)}
+.chk{display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--fg-2); cursor:pointer}
+.chk input{accent-color:var(--cyan); width:15px; height:15px}
+.quick{display:flex; gap:7px; flex-wrap:wrap; margin-top:8px}
+.quick button{
+  background:var(--panel-2); border:1px solid var(--line-2); color:var(--fg-2);
+  border-radius:7px; padding:5px 10px; font-size:11.5px; cursor:pointer; transition:.15s;
+}
+.quick button:hover{border-color:var(--cyan); color:var(--cyan)}
+
+/* ---------- 结果面板 ---------- */
+.result{margin-top:16px; border-top:1px solid var(--line); padding-top:16px; display:none}
+.result.show{display:block}
+.verdict{display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:15px}
+.badge{
+  padding:5px 13px; border-radius:999px; font-size:12px; font-weight:700;
+  font-family:var(--mono); letter-spacing:.5px;
+}
+.badge.ok{background:rgba(52,211,153,.14); color:var(--green); border:1px solid rgba(52,211,153,.35)}
+.badge.bad{background:rgba(248,113,113,.14); color:var(--red); border:1px solid rgba(248,113,113,.35)}
+.badge.run{background:rgba(251,191,36,.14); color:var(--amber); border:1px solid rgba(251,191,36,.35)}
+.badge.idle{background:rgba(147,161,184,.12); color:var(--fg-2); border:1px solid var(--line-2)}
+.answer{
+  background:#0a0f17; border:1px solid var(--line-2); border-left:3px solid var(--cyan);
+  border-radius:9px; padding:13px 15px; font-size:13.5px; line-height:1.75;
+  white-space:pre-wrap; word-break:break-word; margin-bottom:15px;
+}
+/* 指标条 */
+.metrics{display:grid; grid-template-columns:repeat(auto-fit,minmax(108px,1fr)); gap:10px; margin-bottom:17px}
+.metric{
+  background:var(--panel-2); border:1px solid var(--line); border-radius:10px;
+  padding:10px 12px; text-align:center;
+}
+.metric b{display:block; font-size:19px; font-family:var(--mono); color:var(--fg); line-height:1.25}
+.metric span{font-size:10.5px; color:var(--fg-3); letter-spacing:.5px}
+
+/* 步骤时间线 */
+.steps{position:relative; padding-left:3px}
+.step{display:flex; gap:13px; position:relative; padding-bottom:15px}
+.step:last-child{padding-bottom:0}
+.step::before{ /* 竖线 */
+  content:""; position:absolute; left:12px; top:26px; bottom:-2px;
+  width:1px; background:var(--line-2);
+}
+.step:last-child::before{display:none}
+.step .idx{
+  width:25px;height:25px;border-radius:50%;flex:none;z-index:1;
+  display:grid;place-items:center; font-size:11px; font-family:var(--mono); font-weight:700;
+  background:var(--panel-2); border:1px solid var(--line-2); color:var(--fg-2);
+}
+.step.ok .idx{background:rgba(52,211,153,.13); border-color:rgba(52,211,153,.45); color:var(--green)}
+.step.fail .idx{background:rgba(248,113,113,.13); border-color:rgba(248,113,113,.45); color:var(--red)}
+.step .body{flex:1; min-width:0; padding-top:1px}
+.step .act{font-family:var(--mono); font-size:12.5px; color:var(--cyan); font-weight:600}
+.step .msg{font-size:12.5px; color:var(--fg-2); margin-top:3px; word-break:break-word}
+.step .url{font-family:var(--mono); font-size:11px; color:var(--fg-3); margin-top:3px; word-break:break-all}
+
+/* 任务列表 */
+table{width:100%; border-collapse:collapse; font-size:12.5px}
+th{
+  text-align:left; font-size:10.5px; letter-spacing:.7px; text-transform:uppercase;
+  color:var(--fg-3); font-weight:600; padding:0 10px 9px; border-bottom:1px solid var(--line);
+}
+td{padding:9px 10px; border-bottom:1px solid var(--line); color:var(--fg-2); vertical-align:middle}
+tbody tr{cursor:pointer; transition:background .12s}
+tbody tr:hover{background:var(--panel-2)}
+tbody tr:last-child td{border-bottom:none}
+td.tid{font-family:var(--mono); font-size:11.5px; color:var(--violet)}
+td.task{color:var(--fg); max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.empty{text-align:center; color:var(--fg-3); padding:26px 0; font-size:12.5px}
+.spin{
+  display:inline-block; width:11px;height:11px; border-radius:50%;
+  border:2px solid rgba(251,191,36,.3); border-top-color:var(--amber);
+  animation:sp .7s linear infinite; vertical-align:-1px;
+}
+@keyframes sp{to{transform:rotate(360deg)}}
+.err{
+  background:rgba(248,113,113,.09); border:1px solid rgba(248,113,113,.32);
+  color:#fca5a5; border-radius:9px; padding:11px 13px; font-size:12.5px;
+  white-space:pre-wrap; word-break:break-word;
+}
+footer{margin-top:26px; text-align:center; font-size:11.5px; color:var(--fg-3)}
+footer a{color:var(--fg-2); text-decoration:none; border-bottom:1px dotted var(--line-2)}
+footer a:hover{color:var(--cyan)}
+code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); padding:1.5px 5px; border-radius:5px; color:var(--cyan)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">R</div>
+    <div>
+      <h1>browser-agent
+        <small>ReAct 驱动的浏览器任务自动化 · 执行控制台</small>
+      </h1>
+    </div>
+    <div class="spacer"></div>
+    <span class="pill" id="hp"><span class="dot" id="hd"></span><span id="ht">连接中…</span></span>
+  </header>
+
+  <div class="card">
+    <h2>提交任务</h2>
+    <div class="grid">
+      <div>
+        <div class="f">
+          <label for="task">任务描述</label>
+          <textarea id="task" placeholder="例：打开名言网站首页，读出一句话的正文和作者"></textarea>
+          <div class="quick">
+            <button data-t="打开名言网站首页，读出一句话的正文和作者" data-u="https://quotes.toscrape.com/">读名言</button>
+            <button data-t="搜索《三体》并读出第一本书的价格" data-u="https://search.dangdang.com/">当当搜书</button>
+            <button data-t="打开首页，取回页面的主标题文字" data-u="https://example.com/">读标题</button>
+          </div>
+        </div>
+        <div class="f">
+          <label for="url">起始网址</label>
+          <input type="text" id="url" placeholder="https://" value="">
+        </div>
+      </div>
+      <div>
+        <div class="f">
+          <label for="engine">引擎</label>
+          <select id="engine"><option value="">默认</option></select>
+        </div>
+        <div class="f">
+          <label for="ms">最大步数</label>
+          <input type="text" id="ms" placeholder="留空用默认（20）">
+        </div>
+        <div class="f">
+          <label class="chk"><input type="checkbox" id="mock"> 离线替身（不调真实模型、不花钱）</label>
+        </div>
+        <button class="btn btn-primary" id="go" style="width:100%">▶ 开始执行</button>
+      </div>
+    </div>
+
+    <div class="result" id="res">
+      <div class="verdict">
+        <span class="badge idle" id="vb">—</span>
+        <span class="pill" id="vtid" style="display:none"></span>
+      </div>
+      <div class="answer" id="ans" style="display:none"></div>
+      <div class="metrics" id="mets" style="display:none"></div>
+      <div id="err"></div>
+      <div id="steps" class="steps"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>最近任务</h2>
+    <table>
+      <thead><tr>
+        <th style="width:120px">任务 ID</th><th>任务</th>
+        <th style="width:92px">引擎</th><th style="width:96px">状态</th>
+        <th style="width:64px">步数</th><th style="width:78px">耗时</th>
+      </tr></thead>
+      <tbody id="tb"><tr><td colspan="6" class="empty">暂无任务</td></tr></tbody>
+    </table>
+  </div>
+
+  <footer>
+    接口文档 <a href="/docs" target="_blank">/docs</a> ·
+    <a href="/health" target="_blank">/health</a> ·
+    <a href="/engines" target="_blank">/engines</a>
+  </footer>
+</div>
+
+<script>
+/* ------------------------------------------------------------------
+   整个前端零依赖：只用 fetch + 原生 DOM。
+   理由：项目本身强调「运行时零第三方依赖」，前端也不该引入构建链。
+------------------------------------------------------------------ */
+const $ = s => document.querySelector(s);
+const api = (p, o) => fetch(p, o).then(async r => {
+  const t = await r.text();
+  let j; try { j = t ? JSON.parse(t) : {}; } catch { j = {detail: t}; }
+  if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
+  return j;
+});
+let cur = null, timer = null;
+
+/* ---- 健康检查 + 引擎列表 ---- */
+async function boot(){
+  try{
+    const h = await api('/health');
+    $('#hd').className = 'dot ok';
+    $('#ht').textContent = '在线';
+    $('#mock').checked = !h.llm_configured;   // 没配 key 就默认勾离线，避免一点就报错
+    const e = await api('/engines');
+    const sel = $('#engine');
+    e.available.forEach(v => {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = v + (v === e.default ? '（默认）' : '');
+      sel.appendChild(o);
+    });
+    if (e.available.includes('langgraph')) sel.value = e.default;
+  }catch(err){
+    $('#hd').className = 'dot bad';
+    $('#ht').textContent = '离线';
+    $('#mock').checked = true;
+  }
+}
+
+/* ---- 提交任务 ---- */
+$('#go').onclick = async () => {
+  const task = $('#task').value.trim(), url = $('#url').value.trim();
+  if(!task){ alert('请填写任务描述'); return; }
+  if(!url){ alert('请填写起始网址'); return; }
+  const body = { task, url, mock: $('#mock').checked };
+  const eng = $('#engine').value; if(eng) body.engine = eng;
+  const ms = parseInt($('#ms').value, 10); if(ms > 0) body.max_steps = ms;
+
+  $('#go').disabled = true; $('#go').textContent = '提交中…';
+  $('#err').innerHTML = ''; $('#steps').innerHTML = '';
+  $('#ans').style.display = 'none'; $('#mets').style.display = 'none';
+  try{
+    const r = await api('/tasks', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    cur = r.task_id;
+    $('#res').classList.add('show');
+    $('#vtid').style.display = ''; $('#vtid').textContent = cur;
+    paint({status:'pending', steps:0, records:[]});
+    poll();
+  }catch(e){
+    $('#res').classList.add('show');
+    $('#err').innerHTML = '<div class="err">提交失败：' + esc(e.message) + '</div>';
+  }finally{
+    $('#go').disabled = false; $('#go').textContent = '▶ 开始执行';
+  }
+};
+
+/* ---- 轮询：任务是后台异步跑的，只有靠自己拉 ----
+   pending/running 每 1.2s 拉一次；终态就停，避免无意义的请求。 */
+function poll(){
+  clearInterval(timer);
+  timer = setInterval(async () => {
+    if(!cur) return;
+    try{
+      const t = await api('/tasks/' + cur);
+      paint(t);
+      if(t.status === 'succeeded' || t.status === 'failed'){ clearInterval(timer); load(); }
+    }catch(e){ /* 单次失败不打断轮询 */ }
+  }, 1200);
+}
+
+const BADGE = {pending:['run','排队中'], running:['run','执行中'], succeeded:['ok','成功'], failed:['bad','失败']};
+const LABEL = {pending:'排队中', running:'执行中', succeeded:'成功', failed:'失败'};
+
+function paint(t){
+  const [cls, txt] = BADGE[t.status] || ['idle', t.status];
+  const vb = $('#vb');
+  vb.className = 'badge ' + cls;
+  vb.innerHTML = (t.status === 'running' || t.status === 'pending' ? '<span class="spin"></span> ' : '') + txt;
+  $('#vtid').textContent = t.task_id || cur || '';
+
+  if(t.error){ $('#err').innerHTML = '<div class="err">' + esc(t.error) + '</div>'; }
+  else { $('#err').innerHTML = ''; }
+
+  if(t.answer){
+    $('#ans').style.display = ''; $('#ans').textContent = t.answer;
+  }
+  // 指标只在跑完之后才有意义，但执行中也显示实时 token
+  if(t.steps || t.status !== 'pending'){
+    const offline = !!t.offline;
+    const m = [
+      ['步数', t.steps ?? 0],
+      ['耗时', (t.elapsed_seconds ?? 0).toFixed(1) + 's'],
+      // 离线替身的 token 是按字符估出来的，不是真实用量；成本同理。
+      // 标成裸的 "Token / 成本" 会被读成"这次真花了这些钱" —— 必须让口径可见。
+      ['Token' + (offline ? '（估算）' : ''), t.total_tokens ?? 0],
+      [offline ? '成本（离线，未产生费用）' : '成本',
+       offline ? '¥0' : '¥' + (t.cost_yuan ?? 0).toFixed(5)],
+    ];
+    $('#mets').style.display = '';
+    $('#mets').innerHTML = m.map(([k,v]) => `<div class="metric"><b>${esc(String(v))}</b><span>${k}</span></div>`).join('');
+  }
+
+  const rec = t.records || [];
+  $('#steps').innerHTML = rec.map(r => `
+    <div class="step ${r.ok ? 'ok' : 'fail'}">
+      <div class="idx">${r.step}</div>
+      <div class="body">
+        <div class="act">${esc(r.action ?? '(无动作)')}</div>
+        <div class="msg">${esc(r.message)}</div>
+        ${r.url_after ? '<div class="url">' + esc(r.url_after) + '</div>' : ''}
+      </div>
+    </div>`).join('');
+}
+
+/* ---- 任务列表 ---- */
+async function load(){
+  try{
+    const d = await api('/tasks?limit=20');
+    const tb = $('#tb');
+    if(!d.items || !d.items.length){
+      tb.innerHTML = '<tr><td colspan="6" class="empty">暂无任务</td></tr>'; return;
+    }
+    tb.innerHTML = d.items.map(i => {
+      const st = i.status;
+      const color = st === 'succeeded' ? 'var(--green)' : st === 'failed' ? 'var(--red)'
+                  : st === 'running' ? 'var(--amber)' : 'var(--fg-3)';
+      return `<tr data-id="${esc(i.task_id)}">
+        <td class="tid">${esc(i.task_id)}</td>
+        <td class="task" title="${esc(i.task)}">${esc(i.task)}</td>
+        <td>${esc(i.engine || '-')}</td>
+        <td style="color:${color}">${esc(LABEL[st] || st)}</td>
+        <td>${i.steps ?? '-'}</td>
+        <td>${i.elapsed_seconds != null ? i.elapsed_seconds.toFixed(1) + 's' : '-'}</td>
+      </tr>`;
+    }).join('');
+    tb.querySelectorAll('tr[data-id]').forEach(tr => tr.onclick = () => {
+      cur = tr.dataset.id;
+      $('#res').classList.add('show');
+      api('/tasks/' + cur).then(paint).catch(e => {});
+    });
+  }catch(e){}
+}
+
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* 快捷示例 */
+document.querySelectorAll('.quick button').forEach(b => b.onclick = () => {
+  $('#task').value = b.dataset.t; $('#url').value = b.dataset.u;
+});
+
+$('#mock').addEventListener('change', () => {
+  // 离线替身 + 真实模型的按钮文案要区别开，避免误以为在花钱
+});
+
+boot().then(load);
+setInterval(load, 8000);
+</script>
+</body>
+</html>
