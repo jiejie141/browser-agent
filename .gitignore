@@ -1,0 +1,25 @@
+# ---- 密钥 ----
+# 这一行是整个文件里最重要的一行。
+# .env 里存着真实 API key，一旦提交上去会被密钥扫描服务抓到并自动撤销。
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# ---- 运行产物 ----
+# 整个 runs/ 里除了占位文件全部忽略：里面有截图、trace、
+# 以及页面正文快照，属于运行垃圾，不该进版本库。
+runs/*
+!runs/.gitkeep
+
+# ---- 编辑器 ----
+.idea/
+*.swp
+.DS_Store
