@@ -24,7 +24,6 @@ runs/
 *.log
 
 # 开发辅助
-docs/
 eval/
 scripts/
 tests/

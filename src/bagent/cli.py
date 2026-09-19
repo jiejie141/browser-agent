@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -117,9 +118,17 @@ def doctor(settings) -> int:
     console.print(Panel("环境自检", border_style="blue"))
     checks: list[tuple[str, bool, str]] = []
 
+    mock = os.getenv("MOCK", "").strip().lower() in ("1", "true", "yes", "on")
+    offline = os.getenv("OFFLINE", "").strip().lower() in ("1", "true", "yes", "on")
+
     checks.append(("Python", True, sys.version.split()[0]))
     checks.append(("工作目录", True, str(Path.cwd())))
-    checks.append(("配置读取", bool(settings.llm_api_key), settings.llm_model))
+    if mock:
+        # MOCK 模式走剧本替身，本来就不需要 key：
+        # 「有没有 key」不是问题，「是否真的在联网」才是要确认的事。
+        checks.append(("运行模式", True, "MOCK 离线替身，不调用真实模型"))
+    else:
+        checks.append(("配置读取", bool(settings.llm_api_key), settings.llm_model))
     engine = (getattr(settings, "engine", "handwritten") or "handwritten").lower()
     checks.append(("Agent 引擎", True, engine))
     if engine == "langgraph":
@@ -131,19 +140,27 @@ def doctor(settings) -> int:
             checks.append(
                 ("LangGraph", False, "未安装：pip install langgraph（或改用 --engine handwritten）")
             )
-    checks.append(
-        ("视觉通道", settings.vlm_enabled, "已启用" if settings.vlm_enabled else "未配置（将只走 DOM 通道）")
-    )
+    # 视觉通道是**可选**的降级路径：没配 key 时自动退回纯 DOM，
+    # 这是设计行为，不是故障。以前这里返回 settings.vlm_enabled，
+    # 会让「按设计关闭」在自检里显示为「失败」并让 doctor 退出码变 1，
+    # 容器（OFFLINE/MOCK）里必现。改为：配了才算一项检查，没配就如实说明。
+    if settings.vlm_enabled:
+        checks.append(("视觉通道", True, "已启用"))
+    else:
+        checks.append(("视觉通道", True, "未配置，按设计只走 DOM 通道"))
 
-    # 模型连通性
-    try:
-        client = build_client(settings)
-        reply = client.chat(
-            [{"role": "user", "content": "只回复两个字：正常"}], max_tokens=16
-        )
-        checks.append(("模型连通", True, f"返回: {reply[:20]}"))
-    except LLMError as exc:
-        checks.append(("模型连通", False, str(exc)[:160]))
+    # 模型连通性：MOCK / OFFLINE 下一律跳过，避免在无网或不该出网的环境里试探
+    if mock or offline:
+        checks.append(("模型连通", True, "MOCK/OFFLINE 已跳过（不发起网络请求）"))
+    else:
+        try:
+            client = build_client(settings)
+            reply = client.chat(
+                [{"role": "user", "content": "只回复两个字：正常"}], max_tokens=16
+            )
+            checks.append(("模型连通", True, f"返回: {reply[:20]}"))
+        except LLMError as exc:
+            checks.append(("模型连通", False, str(exc)[:160]))
 
     # 浏览器可用性
     try:
