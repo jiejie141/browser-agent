@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -264,3 +266,150 @@ def test_offline_task_reports_zero_cost(client, monkeypatch):
     s = client.get(f"/tasks/{tid}").json()
     assert s["offline"] is True
     assert s["cost_yuan"] == 0.0
+
+
+# --- 步骤要实时进任务表，不能等跑完才填 -------------------------------------
+class _FakeAgent:
+    """只做一件事：按顺序回调 on_step，然后返回一个假结果。
+
+    重点观察点是"回调那一刻任务表里已经有几条"，所以把每条回调时
+    实际看到的条数记下来。
+    """
+
+    def __init__(self, on_step, observed, tid):
+        self._on_step = on_step
+        self._observed = observed
+        self._tid = tid
+
+    async def run(self, **kw):  # noqa: ANN003
+        from bagent.models import Action, StepRecord
+
+        import bagent.api as api
+
+        for i in (1, 2, 3):
+            self._on_step(i, Action(action="scroll"), True, f"第 {i} 步完成")
+            self._observed.append(len(api._TASKS[self._tid]["records"]))
+
+        class _Result:
+            success = True
+            answer = "ok"
+            steps = 3
+            elapsed_seconds = 1.5
+            cost_yuan = 0.0
+            offline = True
+            error = ""
+            run_dir = ""
+            records = [
+                StepRecord(step=i, action=Action(action="scroll"), ok=True,
+                           message=f"第 {i} 步完成")
+                for i in (1, 2, 3)
+            ]
+
+            class usage:
+                total_tokens = 100
+
+        return _Result()
+
+
+class _FakeBrowser:
+    """open_browser 的最小替身：async context manager。"""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):  # noqa: ANN002
+        return False
+
+
+def test_run_task_streams_steps_into_task_table(client, monkeypatch, tmp_path):
+    """每一步都要**立刻**写进任务表。
+
+    控制台每 1.2s 轮询一次 /tasks/{id}。如果 records 只在任务结束时一次性
+    填入，那么整段运行期间界面只能转圈、看不到任何进展 —— 而浏览器任务
+    30 秒起步，使用者会以为它卡死（这一点骗过我整整一轮排查）。
+
+    断言方式：在每次 on_step 回调里读一次任务表，看当时已经有几条。
+    期望 [1, 2, 3] —— 第 N 次回调时就应该有 N 条，而不是跑完才有 3 条。
+    """
+    import bagent.api as api
+
+    real_run_task = api._run_task
+    monkeypatch.setattr(api, "_run_task", _noop_run)
+    monkeypatch.setattr(api, "get_settings", lambda refresh=False: _StubSettings())
+    tid = client.post(
+        "/tasks", json={"task": "打开首页", "url": "https://example.com", "mock": True}
+    ).json()["task_id"]
+
+    observed: list[int] = []
+    monkeypatch.setattr(api, "_run_task", real_run_task)
+    monkeypatch.setattr(
+        api, "build_agent",
+        lambda st, llm=None, on_step=None: _FakeAgent(on_step, observed, tid),
+    )
+    monkeypatch.setattr(api, "open_browser", lambda st, d: _FakeBrowser())
+    monkeypatch.setattr(api, "new_run_dir", lambda st, tag: tmp_path)
+
+    asyncio.run(real_run_task(
+        tid,
+        api.TaskRequest(task="打开首页", url="https://example.com", mock=True),
+        "handwritten",
+    ))
+
+    assert observed == [1, 2, 3], f"步骤没有实时进任务表，回调时看到 {observed}"
+
+    s = client.get(f"/tasks/{tid}").json()
+    assert s["status"] == "succeeded"
+    assert [r["step"] for r in s["records"]] == [1, 2, 3]
+
+
+def test_run_task_streams_error_step_without_action(client, monkeypatch, tmp_path):
+    """格式错误那一步（action=None）也要能进任务表，且动作名兜得住。"""
+    import bagent.api as api
+
+    real_run_task = api._run_task
+    monkeypatch.setattr(api, "_run_task", _noop_run)
+    monkeypatch.setattr(api, "get_settings", lambda refresh=False: _StubSettings())
+    tid = client.post(
+        "/tasks", json={"task": "打开首页", "url": "https://example.com", "mock": True}
+    ).json()["task_id"]
+
+    seen_at_callback: list[str] = []
+
+    class _Agent:
+        def __init__(self, on_step):
+            self._on_step = on_step
+
+        async def run(self, **kw):  # noqa: ANN003
+            import bagent.api as api2
+
+            self._on_step(1, None, False, "输出格式不合法：Expecting value")
+            seen_at_callback.append(api2._TASKS[tid]["records"][0]["action"])
+
+            class _R:
+                success = True
+                answer = "ok"
+                steps = 1
+                elapsed_seconds = 0.1
+                cost_yuan = 0.0
+                offline = True
+                error = ""
+                run_dir = ""
+                records: list = []
+
+                class usage:
+                    total_tokens = 10
+
+            return _R()
+
+    monkeypatch.setattr(api, "_run_task", real_run_task)
+    monkeypatch.setattr(api, "build_agent", lambda st, llm=None, on_step=None: _Agent(on_step))
+    monkeypatch.setattr(api, "open_browser", lambda st, d: _FakeBrowser())
+    monkeypatch.setattr(api, "new_run_dir", lambda st, tag: tmp_path)
+
+    asyncio.run(real_run_task(
+        tid,
+        api.TaskRequest(task="打开首页", url="https://example.com", mock=True),
+        "handwritten",
+    ))
+
+    assert seen_at_callback == ["(格式错误)"]

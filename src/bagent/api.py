@@ -245,11 +245,33 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
     # 而界面上又标着"不花钱" —— 一个开关两处读，迟早对不上。
     st.mock = bool(req.mock)
 
+    def on_step(step: int, action, ok: bool, message: str) -> None:
+        """把每一步**增量**写进任务表。
+
+        这是控制台"逐步执行时间线"的数据来源。控制台每 1.2s 轮询一次
+        /tasks/{id}，如果只在任务结束时一次性写入 records，那么整段运行期间
+        界面只能转圈、看不到任何进展 —— 而一个浏览器任务 30 秒起步，
+        使用者会以为它卡死了（我自己就被这一点骗过一轮排查）。
+
+        注意 action 可能是 None（模型输出非法 JSON 时按 None 回调），
+        所以动作名要按 StepRecord 的口径取，不能直接取 action.action。
+        """
+        name = action.action if action is not None else "(格式错误)"
+        t["records"].append(
+            {"step": step, "action": name, "ok": ok, "message": message, "url_after": ""}
+        )
+        t["steps"] = step
+        t["elapsed_seconds"] = round(
+            (datetime.now(timezone.utc)
+             - datetime.fromisoformat(t["created_at"])).total_seconds(),
+            2,
+        )
+
     try:
         t["offline"] = bool(req.mock)
         llm = MockLLMClient() if req.mock else build_client(st)
         run_dir = new_run_dir(st, tag=f"api-{engine}")
-        agent = build_agent(st, llm=llm)
+        agent = build_agent(st, llm=llm, on_step=on_step)
 
         async with open_browser(st, run_dir) as session:
             result = await agent.run(
@@ -272,6 +294,10 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             "offline": result.offline,
             "error": result.error,
             "run_dir": result.run_dir,
+            # 结束时用**完整记录**覆盖 on_step 增量写进去的那一份。
+            # 增量版本是为了让界面在运行期间就有东西看，缺 url_after 这类
+            # 只有 trace 里才有的字段；终态必须以 trace 为准，否则详情接口
+            # 会永远停在"没跑完时的那个简化版"，审计口径就分叉了。
             "records": [
                 # 用 action_name 而不是 r.action.action：格式错误那一步没有
                 # 可执行的 Action，直接取属性会 AttributeError 打挂整个序列化，

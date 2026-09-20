@@ -66,7 +66,9 @@ def _print_step(step: int, action: Action | None, ok: bool, message: str) -> Non
     在 CI 里只表现为"这一步红了"。
     """
     icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
-    label = action.action if action is not None else "(格式不合法，无动作)"
+    # 措辞与 StepRecord.raw_action 保持一致（那边同样用 "(格式错误)"），
+    # 这样终端、trace.json、API 三处对同一步的称呼是一样的。
+    label = action.action if action is not None else "(格式错误)"
     console.print(f"  {icon} [bold]第 {step} 步[/bold] {label}", end="")
     if action is not None and action.ref is not None:
         console.print(f" [{action.ref}]", end="")
