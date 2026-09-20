@@ -55,13 +55,23 @@ async def _confirm_interactive(prompt: str) -> bool:
     return ans.strip().lower() in ("y", "yes")
 
 
-def _print_step(step: int, action: Action, ok: bool, message: str) -> None:
+def _print_step(step: int, action: Action | None, ok: bool, message: str) -> None:
+    """on_step 回调，把每一步打到终端。
+
+    action 可能是 None —— 模型输出不是合法 JSON 时就是这样回调的
+    （见 agent.py / graph_agent.py：没有合法 Action 可传，用 None 表示
+    "这一步没有动作"）。StepCallback 的类型签名也正是 Action | None，
+    所以这里必须先判 None：否则一次格式抖动就会让 CLI 自己崩掉，
+    真正的原因（模型输出不合法）被压在 AttributeError 堆栈下面，
+    在 CI 里只表现为"这一步红了"。
+    """
     icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
-    console.print(f"  {icon} [bold]第 {step} 步[/bold] {action.action}", end="")
-    if action.ref is not None:
+    label = action.action if action is not None else "(格式不合法，无动作)"
+    console.print(f"  {icon} [bold]第 {step} 步[/bold] {label}", end="")
+    if action is not None and action.ref is not None:
         console.print(f" [{action.ref}]", end="")
     console.print()
-    if action.thought:
+    if action is not None and action.thought:
         console.print(f"    [dim]想法: {action.thought}[/dim]")
     console.print(f"    {message}")
 
@@ -247,6 +257,12 @@ def main(argv: list[str] | None = None) -> int:
         settings.headless = False
     if args.engine:
         settings.engine = args.engine
+    if args.mock:
+        # --mock 是命令行开关，而 Settings 只认 MOCK 环境变量，两边必须合流。
+        # 不合流的后果不是"少个提示"，而是：agent.run() 用 settings.mock 判定
+        # 是否离线（离线时成本必须报 0），于是离线跑一次仍会拿估算 token 乘单价，
+        # 报出一个并不存在的花费（实测 ¥0.00347）—— 使用者会以为真花了钱。
+        settings.mock = True
     setup_logging(settings.log_level)
 
     if args.doctor:

@@ -19,6 +19,10 @@ jobs:
   test:
     name: 单元测试与引擎校验
     runs-on: ubuntu-latest
+    # runner 上没有显示器。代码里的默认值已经是无头，这里再显式写一遍：
+    # 让"CI 跑在无头环境"这件事写在 workflow 里，而不是靠某一个默认值兜着。
+    env:
+      HEADLESS: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -77,20 +81,32 @@ jobs:
       - name: 构建镜像
         run: docker build -t browser-agent:ci .
 
-      # 镜像起来后必须能响应 /health，否则算失败
+      # 镜像起来后必须能响应 /health，否则算失败。
+      # 注意日志要在判定失败**之前**打印：原来 `curl -fsS` 直接放在末尾，
+      # 而 step 的 shell 是 `bash -e`，最后那次 curl 一失败就退出，
+      # 后面那句 `docker logs ba` 永远执行不到 —— 于是 CI 只告诉你"探活失败"，
+      # 却不告诉你容器为什么起不来。这一个坑让排查多花了一轮。
       - name: 启动并探活
         run: |
           docker run -d --name ba -p 8000:8000 \
             browser-agent:ci \
             -m uvicorn bagent.api:app --host 0.0.0.0 --port 8000
+          ok=0
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8000/health > /dev/null; then
-              echo "health OK"; break
+              echo "health OK"; ok=1; break
             fi
             sleep 2
           done
+          echo "=========== docker logs ba ==========="
+          docker logs ba || true
+          echo "=========== docker ps -a ============="
+          docker ps -a || true
+          if [ "$ok" != "1" ]; then
+            echo "::error::容器已启动但 /health 未就绪，容器日志见上"
+            exit 1
+          fi
           curl -fsS http://127.0.0.1:8000/health
-          docker logs ba
 
       - name: 清理
         if: always()

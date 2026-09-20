@@ -62,7 +62,13 @@ class Settings:
     step_timeout_seconds: int = field(
         default_factory=lambda: _get_int("STEP_TIMEOUT_SECONDS", 30)
     )
-    headless: bool = field(default_factory=lambda: _get_bool("HEADLESS", False))
+    # 默认无头。这个默认值是被 CI 教出来的：
+    # 原来默认 False（有头），本地有显示器所以看不出问题，而 GitHub Actions
+    # 的 runner 没有 X server，Playwright 直接报
+    # "launched a headed browser without having a XServer running" 然后退出。
+    # 无头才是"脚本/服务/容器"场景下的安全默认；想看着浏览器跑，
+    # 复制 .env.example（里面写了 HEADLESS=false）或用 --headful。
+    headless: bool = field(default_factory=lambda: _get_bool("HEADLESS", True))
     log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "INFO").upper())
 
     # ---- Agent 引擎 ----

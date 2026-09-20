@@ -46,8 +46,6 @@ from typing import Annotated, Awaitable, Callable, Literal, TypedDict
 
 import logging
 
-from langgraph.graph import END, StateGraph
-
 from .agent import (
     LOOP_STOP_AT,
     LOOP_WARN_AT,
@@ -64,6 +62,35 @@ from .models import Action, StepRecord, Usage, parse_action
 from .perception import perceive
 
 log = logging.getLogger(__name__)
+
+
+def _require_langgraph():
+    """延迟导入 langgraph，缺了就抛一句能照着做的错。
+
+    **为什么不能写在模块顶层。**
+    这个文件被 `cli.py` 和 `api.py` 在模块级导入（`from .graph_agent import
+    build_agent`）。如果在顶层写 `from langgraph.graph import END, StateGraph`，
+    那么 langgraph 就从"跑图引擎才需要的可选依赖"变成了"import 这个包的
+    任何一个入口都需要的硬依赖"：
+
+      - 容器里按 requirements.txt 装依赖，langgraph 是注释掉的（见该文件说明），
+        于是 `python -m uvicorn bagent.api:app` 在 import 阶段就
+        ModuleNotFoundError，容器秒退、探活必失败 —— 而报错信息里
+        只字不提"是你少装了一个可选依赖"。
+      - 更糟的是它会让 `--engine handwritten` 也跑不起来：
+        手写循环根本不需要 langgraph，却被它的 import 连坐。
+
+    所以导入推迟到真正建图那一刻，并且把补救办法写进异常消息。
+    """
+    try:
+        from langgraph.graph import END, StateGraph
+    except ImportError as exc:  # pragma: no cover - 取决于环境
+        raise RuntimeError(
+            "LangGraph 引擎需要 langgraph，但当前环境没有安装。"
+            "请执行 `pip install langgraph`（或改用 `--engine handwritten`，"
+            "手写循环零额外依赖）。"
+        ) from exc
+    return END, StateGraph
 
 # 阈值从 agent.py 导入，保证两个引擎「什么时候停」完全一致。
 # 这里只做 re-export，方便测试与外部引用。
@@ -172,6 +199,7 @@ class LangGraphReActAgent:
     # 建图
     # ------------------------------------------------------------------
     def _build_graph(self):
+        END, StateGraph = _require_langgraph()
         g = StateGraph(AgentState)
         g.add_node("perceive", self._node_perceive)
         g.add_node("reason", self._node_reason)
