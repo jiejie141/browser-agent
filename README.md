@@ -237,8 +237,12 @@ def route_after_act(state) -> Literal["perceive", "end"]:
 
 ```powershell
 pip install fastapi uvicorn
-uvicorn bagent.api:app --reload --port 8000
+uvicorn --app-dir src bagent.api:app --reload --port 8000
 ```
+
+**`--app-dir src` 不能省**：`src/` 这种布局下，直接在仓库根目录跑
+`uvicorn bagent.api:app` 会 `ModuleNotFoundError: No module named 'bagent'`。
+容器里没暴露这个问题，是因为 Dockerfile 设了 `PYTHONPATH=/app/src`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -267,7 +271,13 @@ docker run --shm-size=1g -p 8000:8000 browser-agent -m uvicorn bagent.api:app --
 和全部系统依赖；自己从头 `apt install` 既慢又容易漏库（缺 `libnss3` / `libatk` 时报错很
 不直观）。容器内默认 `HEADLESS=true MOCK=true OFFLINE=true`。
 
-配合仓库根目录的 `docker-compose.yml` 可与 pr-review-agent 一起编排。
+非 root 运行：浏览器里跑的是「模型生成的页面操作」，权限必须收窄。
+
+镜像默认命令是 `python main.py --help`；`ENTRYPOINT` 只固定解释器，
+所以 `docker run 镜像 -m uvicorn ...` 会被正确拼成 `python -m uvicorn ...`。
+
+> 本仓库**没有**附带 `docker-compose.yml`。上面那条 `docker run` 就是完整的启动方式；
+> 想和 pr-review-agent 一起编排的话，那个文件需要你自己按需写。
 
 ### 构建踩过的两个坑
 

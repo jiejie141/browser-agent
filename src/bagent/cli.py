@@ -113,12 +113,36 @@ async def run_one(task: str, url: str, max_steps: int | None, settings, mock: bo
     return 0 if result.success else 1
 
 
-def doctor(settings) -> int:
-    """环境自检：跑任务之前先确认每一环都通，省得中途炸掉。"""
+def _probe_browser() -> None:
+    """起一个无头 Chromium 再关掉，确认"浏览器"这一环是通的。
+
+    单独抽成函数是为了可测：真起浏览器要一两秒，
+    放进单元测试会让套件变慢；测试里 monkeypatch 掉它即可。
+    """
+    from playwright.async_api import async_playwright
+
+    async def _probe():
+        pw = await async_playwright().start()
+        b = await pw.chromium.launch(headless=True)
+        await b.close()
+        await pw.stop()
+
+    asyncio.run(_probe())
+
+
+def doctor(settings, mock: bool = False) -> int:
+    """环境自检：跑任务之前先确认每一环都通，省得中途炸掉。
+
+    `mock` 是命令行开关 --mock 的取值。**必须由调用方传进来**，
+    不能只读环境变量 —— CI 里跑的是 `main.py --doctor --mock`，
+    没有任何环境变量，只看 MOCK 会把离线自检误判成在线模式。
+    """
     console.print(Panel("环境自检", border_style="blue"))
     checks: list[tuple[str, bool, str]] = []
 
-    mock = os.getenv("MOCK", "").strip().lower() in ("1", "true", "yes", "on")
+    # 离线判定有两个入口：环境变量 MOCK 和命令行开关 --mock。
+    # 两边都要认：容器镜像里靠 ENV MOCK=true，CI 里靠 --mock 参数。
+    mock = mock or os.getenv("MOCK", "").strip().lower() in ("1", "true", "yes", "on")
     offline = os.getenv("OFFLINE", "").strip().lower() in ("1", "true", "yes", "on")
 
     checks.append(("Python", True, sys.version.split()[0]))
@@ -161,18 +185,16 @@ def doctor(settings) -> int:
             checks.append(("模型连通", True, f"返回: {reply[:20]}"))
         except LLMError as exc:
             checks.append(("模型连通", False, str(exc)[:160]))
+        except Exception as exc:
+            # build_client() 在缺 key 时抛的是 openai.OpenAIError，**不是 LLMError**
+            # （校验在 OpenAI 客户端构造里就发生了，还没轮到我们的错误类型）。
+            # 只捕 LLMError 会让自检自己崩掉 —— 那比"某项检查失败"更糟：
+            # 堆栈和退出码会把真正的原因盖住，CI 里只看到"这一步红了"。
+            checks.append(("模型连通", False, f"{type(exc).__name__}: {str(exc)[:120]}"))
 
-    # 浏览器可用性
+    # 浏览器可用性（探针见 _probe_browser；抽成函数是为了测试里能换掉它）
     try:
-        from playwright.async_api import async_playwright
-
-        async def _probe():
-            pw = await async_playwright().start()
-            b = await pw.chromium.launch(headless=True)
-            await b.close()
-            await pw.stop()
-
-        asyncio.run(_probe())
+        _probe_browser()
         checks.append(("Chromium", True, "可启动"))
     except Exception as exc:
         checks.append(("Chromium", False, f"{type(exc).__name__}: {str(exc)[:120]}"))
@@ -228,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(settings.log_level)
 
     if args.doctor:
-        return doctor(settings)
+        return doctor(settings, mock=args.mock)
 
     if not args.mock:
         try:

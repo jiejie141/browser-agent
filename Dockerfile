@@ -42,5 +42,11 @@ ENV HEADLESS=true \
     MOCK=true \
     OFFLINE=true
 
-ENTRYPOINT ["python", "main.py"]
-CMD ["--help"]
+# 入口点只固定解释器，不固定脚本 —— 这样 `docker run 镜像 -m uvicorn ...`
+# 才会变成 `python -m uvicorn ...`。
+# 踩过的坑：原来写的是 ENTRYPOINT ["python", "main.py"]，于是 CI 里那条
+# `docker run ... -m uvicorn bagent.api:app --host 0.0.0.0` 被拼成
+# `python main.py -m uvicorn ...`，argparse 直接 unrecognized arguments、
+# 退出码 2、容器秒退、探活必失败。默认命令仍走 main.py，行为不变。
+ENTRYPOINT ["python"]
+CMD ["main.py", "--help"]
