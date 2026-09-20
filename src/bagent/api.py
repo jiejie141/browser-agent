@@ -267,21 +267,29 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             2,
         )
 
+    cm = None
     try:
         t["offline"] = bool(req.mock)
         llm = MockLLMClient() if req.mock else build_client(st)
         run_dir = new_run_dir(st, tag=f"api-{engine}")
         agent = build_agent(st, llm=llm, on_step=on_step)
 
-        async with open_browser(st, run_dir) as session:
-            result = await agent.run(
-                task=req.task,
-                start_url=req.url,
-                session=session,
-                run_dir=run_dir,
-                confirm=None,  # 服务端无交互终端 → 敏感操作一律拒绝（安全默认）
-                max_steps=req.max_steps,
-            )
+        # 这里刻意不用 `async with`：它的退出点会把"关浏览器"塞在
+        # "写终态"之前。而关浏览器是会卡住的（见下），一旦卡住，
+        # 任务就永远停在 running —— 实测同一个离线任务 3.3 秒走完 5 步，
+        # 150 秒都没进终态，控制台一直转圈。手动进入 + 在 finally 里关，
+        # 才能保证终态先落表。
+        cm = open_browser(st, run_dir)
+        session = await cm.__aenter__()
+
+        result = await agent.run(
+            task=req.task,
+            start_url=req.url,
+            session=session,
+            run_dir=run_dir,
+            confirm=None,  # 服务端无交互终端 → 敏感操作一律拒绝（安全默认）
+            max_steps=req.max_steps,
+        )
 
         t.update({
             "status": "succeeded" if result.success else "failed",
@@ -317,7 +325,26 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
         t["status"] = "failed"
         t["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        # 终态已经写完了，这里只回收浏览器资源。所以它卡住也不影响调用方。
+        if cm is not None:
+            await _close_browser(cm, timeout=getattr(st, "teardown_timeout_seconds", 8.0))
         t["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+async def _close_browser(cm: Any, *, timeout: float) -> None:
+    """关浏览器，但**绝不让它决定任务的终态**。
+
+    放在 finally 里是为了异常路径也能关；再包一层 wait_for 是因为
+    `BrowserSession.__aexit__` 之外的实现（包括测试替身）未必自带超时。
+    超时只记警告：此时终态（succeeded/failed）已经在任务表里了，
+    调用方不会再看到 running。
+    """
+    try:
+        await asyncio.wait_for(cm.__aexit__(None, None, None), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.warning("浏览器收尾超过 %.1fs，已放弃等待；任务状态已落表", timeout)
+    except Exception:
+        log.debug("浏览器收尾异常", exc_info=True)
 
 
 def _evict_old() -> None:

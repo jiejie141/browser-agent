@@ -73,6 +73,29 @@ class BrowserSession:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        """收尾：关 page/context、关浏览器、停 Playwright。
+
+        整个收尾**只给一个总时间预算**（settings.teardown_timeout_seconds），
+        超了就直接放弃等待。这一条是被真实故障逼出来的，不是防御性编程：
+        本机冒烟时任务 4.3 秒就把 5 步全跑完了，进程却在收尾上卡了 4 分钟不退出；
+        走 API 时更糟 —— 终态原本写在收尾之后，于是任务永远停在 running，
+        控制台一直转圈，而它其实早就成功了。
+
+        收尾失败**不是**任务失败：该落的盘都落了，它只负责回收进程资源。
+        所以这里超时只记一条警告，不往外抛。
+        """
+        try:
+            await asyncio.wait_for(
+                self._close_all(), timeout=self.settings.teardown_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "浏览器收尾超过 %.1fs 仍未完成，已放弃等待（任务结果不受影响）",
+                self.settings.teardown_timeout_seconds,
+            )
+
+    async def _close_all(self) -> None:
+        # 顺序反着来：先关子级（context）再关父级（browser），最后停 Playwright 驱动。
         for closer in (self._context, self._browser):
             try:
                 if closer:

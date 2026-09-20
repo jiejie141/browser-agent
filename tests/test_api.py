@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -120,6 +121,8 @@ class _StubSettings:
     llm_model = "stub"
     engine = "handwritten"
     llm_base_url = "https://example.invalid/v1"
+    # api._run_task 的收尾护栏要读它；调小一点，让"收尾卡住"的用例不用真等 8 秒。
+    teardown_timeout_seconds = 0.3
 
 
 def test_task_status_model_shape(client, monkeypatch):
@@ -413,3 +416,57 @@ def test_run_task_streams_error_step_without_action(client, monkeypatch, tmp_pat
     ))
 
     assert seen_at_callback == ["(格式错误)"]
+
+
+# --- 终态不能被浏览器收尾绑架 -------------------------------------------------
+class _HangingBrowser:
+    """open_browser 的替身：进入正常，收尾永不返回。"""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):  # noqa: ANN002
+        await asyncio.sleep(999)
+
+
+def test_task_reaches_terminal_state_even_if_teardown_hangs(client, monkeypatch, tmp_path):
+    """收尾卡住时，任务仍必须进终态。
+
+    这条是照着真实故障写的，不是假想：终态原本写在 `async with open_browser(...)`
+    之后，而浏览器收尾会卡住 → 任务 3.3 秒就跑完 5 步（时间线也实时可见），
+    却 150 秒都停在 running，控制台一直转圈。
+
+    收尾只负责回收进程资源，绝不该决定"任务完成了没有"。
+    """
+    import bagent.api as api
+
+    real_run_task = api._run_task
+    monkeypatch.setattr(api, "_run_task", _noop_run)
+    monkeypatch.setattr(api, "get_settings", lambda refresh=False: _StubSettings())
+    tid = client.post(
+        "/tasks", json={"task": "打开首页", "url": "https://example.com", "mock": True}
+    ).json()["task_id"]
+
+    monkeypatch.setattr(api, "_run_task", real_run_task)
+    monkeypatch.setattr(
+        api, "build_agent",
+        lambda st, llm=None, on_step=None: _FakeAgent(on_step, [], tid),
+    )
+    monkeypatch.setattr(api, "open_browser", lambda st, d: _HangingBrowser())
+    monkeypatch.setattr(api, "new_run_dir", lambda st, tag: tmp_path)
+
+    t0 = time.monotonic()
+    asyncio.run(asyncio.wait_for(
+        real_run_task(
+            tid,
+            api.TaskRequest(task="打开首页", url="https://example.com", mock=True),
+            "handwritten",
+        ),
+        timeout=20,
+    ))
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 15, f"被收尾拖住了 {elapsed:.1f}s"
+    s = client.get(f"/tasks/{tid}").json()
+    assert s["status"] == "succeeded", f"终态被收尾绑架了，仍是 {s['status']}"
+    assert s["finished_at"], "finished_at 也必须落表"

@@ -147,7 +147,9 @@ LLM_MODEL=<模型名>
 | `LLM_MODEL` | `deepseek-chat` | 模型名 |
 | `VLM_API_KEY` | 空 | 视觉通道的 key。**留空则自动跳过视觉降级**，只走 DOM |
 | `MAX_STEPS` | 20 | 单个任务的最大步数，防死循环 |
-| `HEADLESS` | false | true = 不显示浏览器窗口 |
+| `STEP_TIMEOUT_SECONDS` | 30 | 单个浏览器动作的超时 |
+| `HEADLESS` | `true`（代码默认）/ `false`（`.env.example` 里显式写成 false） | true = 不显示浏览器窗口。脚本、服务、CI 都该无头；本地想看浏览器跑就填 false |
+| `TEARDOWN_TIMEOUT_SECONDS` | 8 | 浏览器收尾的总时间预算。超了放弃等待（任务状态不受影响），见「控制台暴露出来的四个真实缺陷」第 4 条 |
 
 ---
 
@@ -324,10 +326,10 @@ def console() -> FileResponse:
   `id="task"` / `id="go"` 等锚点。一旦 Dockerfile 或打包清单漏掉 `web/` 目录，
   测试会立刻红，而不是等线上打开发现 404。
 
-### 控制台暴露出来的三个真实缺陷
+### 控制台暴露出来的四个真实缺陷
 
 把后端接到一个真实界面上之后，原先"接口能返回 200 就算对"的地方全部露了馅。
-这三处都是**后端逻辑问题**（不是渲染问题），控制台只是让它们变得可见：
+这四处都是**后端逻辑问题**（不是渲染问题），控制台只是让它们变得可见：
 
 1. **离线任务的成本是凭空算出来的。** 离线替身的 token 是按字符估算的，
    而 `cost_yuan` 照常乘以单价，于是离线跑一次会显示 `¥0.00347` ——
@@ -346,8 +348,33 @@ def console() -> FileResponse:
    正确做法是 `StepRecord.action` 放宽为 `Action | None`，另加 `raw_action` 承载原始字符串。
 3. **列表接口不返回 `steps` / `elapsed_seconds`**，导致前端表格这两列只能显示 `-`，
    除非客户端对每一行再打一次详情接口（20 行 = 21 个请求）。这两项在列表数据里本来就是现成的。
+4. **任务"跑完了"却永远显示在执行中。** 这条最要命，因为它把成功伪装成卡死。
+   终态原本写在 `async with open_browser(...)` **之后**，而浏览器收尾
+   （`context.close()` / `browser.close()` / `playwright.stop()`）在某些环境下
+   会长时间不返回 —— 收尾卡住 = 终态永远不写 = 控制台一直转圈。
+   实测：一个离线任务 **3.3 秒**就走完 5 步（每步的时间线都是实时可见的），
+   但 **150 秒**都没进终态；CLI 更直白，报告早就打完了，进程却卡在收尾上
+   4 分钟不退出。这里的关键认识是：**收尾不属于任务本身**，它只负责回收进程资源，
+   不该决定"任务完成了没有"。修法是两层：
 
-前两条都补了回归测试，断言的是**语义**而不是返回值：
+   - `BrowserSession.__aexit__` 给整个收尾一个总时间预算
+     （`TEARDOWN_TIMEOUT_SECONDS`，默认 8 秒），超时记一条警告就放弃等待；
+   - `_run_task` 不再用 `async with`，改成手动进入 + 在 `finally` 里收尾，
+     这样终态能在收尾**之前**落表。
+
+   注意这两层不是重复：第一层让 CLI 能自己退出，第二层保证即使别人换了个
+   没有超时护栏的实现，服务端的终态也不会被拖住。回归测试
+   `test_task_reaches_terminal_state_even_if_teardown_hangs` 用一个
+   "收尾永不返回"的替身把这一点钉住了。
+
+   顺带一个诚实的边界：超时放弃之后，那个 Playwright 驱动子进程会成为孤儿，
+   Windows 上的 `asyncio` 在解释器退出时还会等它约 30 秒，并打印几条
+   `unclosed transport` 的 `ResourceWarning`。也就是说 CLI 的**总**耗时可能到 40 秒
+   量级 —— 但报告在 12 秒内就打完、任务状态也早已落表，剩下的只是进程回收。
+   在 CI（Linux）上收尾约 1 秒完成，完全不会走到这条路。
+
+前三条都补了回归测试，断言的是**语义**而不是返回值：
 `test_offline_task_reports_zero_cost` 要求离线任务 `cost_yuan == 0`，
-`test_step_record_accepts_error_step` 要求"格式错误"这一步能落盘且能序列化。
+`test_step_record_accepts_error_step` 要求"格式错误"这一步能落盘且能序列化，
+`test_task_reaches_terminal_state_even_if_teardown_hangs` 要求"收尾卡住也要进终态"。
 

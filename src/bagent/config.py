@@ -32,6 +32,16 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_float(name: str, default: float) -> float:
+    raw = _get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _get_bool(name: str, default: bool) -> bool:
     raw = _get(name).lower()
     if raw in ("1", "true", "yes", "on"):
@@ -70,6 +80,15 @@ class Settings:
     # 复制 .env.example（里面写了 HEADLESS=false）或用 --headful。
     headless: bool = field(default_factory=lambda: _get_bool("HEADLESS", True))
     log_level: str = field(default_factory=lambda: _get("LOG_LEVEL", "INFO").upper())
+
+    # 浏览器收尾（context.close / browser.close / playwright.stop）的整体超时上限，秒。
+    # 之所以要有这个值：收尾在某些环境下会长时间不返回（本机实测卡到分钟级，
+    # 同一个任务在 CI 上 1.7 秒就干净退出），而收尾**不属于任务本身**——
+    # 结果早已落盘，却让调用方以为任务还没结束（Web 控制台就一直转圈）。
+    # 超时即放弃等待，宁可留个待回收的进程，也不要让"已完成"被无关步骤掩盖。
+    teardown_timeout_seconds: float = field(
+        default_factory=lambda: _get_float("TEARDOWN_TIMEOUT_SECONDS", 8.0)
+    )
 
     # ---- Agent 引擎 ----
     # handwritten：agent.py 里的手写 ReAct 循环（默认，零额外依赖）
