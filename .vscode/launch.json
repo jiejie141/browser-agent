@@ -75,6 +75,67 @@
       "cwd": "${workspaceFolder}",
       "env": { "PYTHONIOENCODING": "utf-8" },
       "justMyCode": false
+    },
+    {
+      // 最直观的一个：起来之后浏览器打开 http://127.0.0.1:8000/
+      // 页面上勾「离线替身」→ 点快捷按钮 → 开始执行，就能看到逐步时间线。
+      // 不勾离线替身才需要 .env 里的 LLM_API_KEY。
+      "name": "⑥ 启动 Web 控制台（推荐先跑这个）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["bagent.api:app", "--host", "127.0.0.1", "--port", "8000"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "justMyCode": false
+    },
+    {
+      // 起来后打开 http://127.0.0.1:8000/docs 可以直接在页面上试接口。
+      "name": "⑥b 只启动 API（看 /docs）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["bagent.api:app", "--host", "127.0.0.1", "--port", "8001", "--reload"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "justMyCode": false
+    },
+    {
+      "name": "⑦ 跑全部单测",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests", "-q"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8",
+        // runner 上没有显示器；本地想看有头浏览器就把这行删掉
+        "HEADLESS": "true"
+      },
+      "justMyCode": false
+    },
+    {
+      "name": "⑧ 双引擎对比（手写 vs LangGraph）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval/compare_engines.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "justMyCode": false
     }
   ]
 }
