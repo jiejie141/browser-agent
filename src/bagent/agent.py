@@ -98,14 +98,69 @@ MAX_CONSECUTIVE_FAILURES = 3
 def _action_signature(action: Action) -> str:
     """动作指纹：用来识别"原地打转"。
 
-    只看动作名和 ref，**不看 thought**——因为模型每次编的理由都不一样，
+    只看动作名和 ref，**不看 thought** —— 模型每次编的理由都不一样，
     但实际执行的动作可能是同一个。识别循环必须看行为，不能看说辞。
+
+    ⚠️ `scroll` **刻意不带 dy**，这条是一次**模型层消融**抓出来的：
+
+    原先是 `scroll#{dy}`，于是"改个滚动量"就等于换了一个新动作。
+    实测（强模型跑到 t06，`runs/20260921-193525-t06/trace.json`）：
+    20 步里 13 次 `scroll`，dy 依次是 -200 / -1000 / -500 / -2000 / -3000 /
+    +2000 / -3000 / -5000 / -1000 / -10000 / -5000 …，**每个都不一样**，
+    指纹各不相同，熔断一次都没触发 —— 20 步全部执行成功、无任何报错，
+    任务却仍然没完成。换成方向签名后熔断点 = 第 7 步（省下 13 步）。
+
+    **为什么按方向而不是具体像素**：反复滚动本身就是"没有进展"的形态，
+    不需要靠"滚了多远"来区分；但"向下找内容 / 再向上回看"是合理动作，
+    所以保留 down / up 的方向区分，只把幅度丢掉。
+
+    **这条改动的代价我量过**：拿 18 次基线重算，只有那 3 次**本来就熔断
+    失败**的运行会被命中，且熔断点完全相同（18 / 18 / 17）——
+    没有任何一次通过的运行受影响。
     """
     if action.action in ("click", "type", "goto"):
         return f"{action.action}#{action.ref or action.url}"
     if action.action == "scroll":
-        return f"scroll#{action.dy}"
+        dy = action.dy or 0
+        if dy > 0:
+            return "scroll#down"
+        if dy < 0:
+            return "scroll#up"
+        return "scroll"
     return action.action
+
+
+def loop_counts(trail: list[str], sig: str) -> tuple[int, int]:
+    """返回 `(累计出现次数, 末尾连续次数)`。
+
+    ⚠️ 这两个数**必须分开算**，因为原来它们被混成了一个：
+
+    判据用的是"整轮累计出现次数"（`trail.count(sig)`），
+    但写回历史的措辞是"你已经**连续** N 次执行 `X`"。
+    实测（`runs/eval_20260921-145218.json`）三条熔断里有两条对不上：
+
+    - `t05` 的 `click#2` 出现在第 1 / 5 / 7 / 13 / 18 步 ——
+      中间隔着 `type` / `extract` / `scroll` / `click#43` / `type`，
+      **根本不是连续的**；
+    - `t06` 的 `click#1` 出现在第 3 / 8 / 9 / 12 / 17 步，同样不连续；
+    - 只有 `t04` 的 `type#20` 是真的连续（第 16 / 17 / 18 步）。
+
+    也就是说，模型读到的是一句**与事实不符**的历史。而小模型本来就
+    是靠着这句警告被推着换策略的 —— 在最需要它改的时候喂错信息，
+    是这个警告最容易失效的方式。
+
+    这里只把两个数都算出来、如实描述。
+    **判据本身要不要从"累计"改成"连续"，是另一个问题**：
+    那会改变熔断时机、进而动到基线数字，必须单独立项测
+    （见 `docs/实验记录.md`），不能混在"修措辞"里偷偷换掉。
+    """
+    total = trail.count(sig)
+    consecutive = 0
+    for s in reversed(trail):
+        if s != sig:
+            break
+        consecutive += 1
+    return total, consecutive
 
 
 @dataclass
@@ -324,15 +379,20 @@ class ReActAgent:
             # ---------- 循环检测 ----------
             sig = _action_signature(action)
             sig_trail.append(sig)
-            repeats = sig_trail.count(sig)
+            repeats, consecutive = loop_counts(sig_trail, sig)
             if repeats >= LOOP_STOP_AT:
-                error = f"检测到原地打转：动作 {sig} 重复 {repeats} 次且无进展，已熔断"
+                error = (
+                    f"检测到原地打转：动作 {sig} 累计出现 {repeats} 次"
+                    f"（其中末尾连续 {consecutive} 次）且无进展，已熔断"
+                )
                 break
             if repeats >= LOOP_WARN_AT:
                 # 把警告写回历史，下一轮模型一定会看到。
                 # 注意措辞是"禁止"而不是"建议"——小模型对强约束才有反应。
+                # 数字必须如实：判据是**累计**，就不能写成"连续"（见 loop_counts）。
                 history.append(
-                    f"⚠ 严重警告：你已经连续 {repeats} 次执行 `{sig}`，"
+                    f"⚠ 严重警告：动作 `{sig}` 已经累计出现 {repeats} 次"
+                    f"（其中末尾连续 {consecutive} 次），"
                     f"页面没有任何进展。**禁止再执行这个动作**。"
                     f"你现在必须二选一：(a) 换一个完全不同的元素编号；(b) 直接调用 finish "
                     f"给出结论。如果你已经能从页面正文里看到答案，请立刻 finish。"

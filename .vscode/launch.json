@@ -198,6 +198,89 @@
         "PYTHONIOENCODING": "utf-8"
       },
       "justMyCode": false
+    },
+    {
+      // 跑一轮真实站点集要十几分钟，而"该不该配代理"是个配置问题。
+      // 这个几秒就能回答：直连 vs 走代理的可达性对照。
+      // 实测结论（2026-09-21）：12 个站直连 5/12、走代理也是 5/12 ——
+      // 被拦的不是外网可达性，而是出口按 TLS 栈区分客户端，代理救不了。
+      // 换代理地址就改下面 args 里的 --proxy。
+      "name": "⑤e 站点可达性对照（直连 vs 代理）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval/probe_reachability.py",
+      "args": ["--proxy", "http://127.0.0.1:7890"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8",
+        "HEADLESS": "true"
+      },
+      "justMyCode": false
+    },
+    {
+      // ⭐ 模型层消融：同一套任务、同一份代码，只换模型。
+      // 用途是把"骨架缺陷"和"模型缺陷"分开 —— 换强模型后仍然失败的，
+      // 才是真的引擎问题（不是模型太笨）。基线（Qwen2.5-7B）是 15/18。
+      // 注意 env 里的 LLM_MODEL **覆盖** .env 的值（load_dotenv 不覆盖已有环境变量），
+      // 所以不会弄脏你的 .env。换别的强模型改这一行即可。
+      "name": "⑨ 模型层消融（强模型 × 3 轮）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval/run_eval.py",
+      "args": ["--repeat", "3"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8",
+        "HEADLESS": "true",
+        "LLM_MODEL": "deepseek-ai/DeepSeek-V3.2"
+      },
+      "justMyCode": false
+    },
+    {
+      // 验证实验 7 那条修复：scroll 指纹不再带 dy 之后，t06 会不会好一点。
+      // 修复只把熔断点从"从不触发"提前到第 7 步（省 13 步），
+      // **并不保证 t06 就过** —— 到底过不过，跑这个才知道。
+      "name": "⑤f 只跑 t06（验证 scroll 指纹修复）×3",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval/run_eval.py",
+      "args": ["--only", "t06", "--repeat", "3"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8",
+        "HEADLESS": "true"
+      },
+      "justMyCode": false
+    },
+    {
+      // 两条引擎的"什么时候停"必须一致，否则 A/B 对比失去意义。
+      // 这里顺手把循环计数的口径也钉住：日志说"连续 N 次"，
+      // 判据就不能是"累计 N 次"（真实轨迹里三条熔断有两条对不上）。
+      "name": "⑦b 只跑熔断/循环检测相关单测",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "tests/test_graph_agent.py::TestLoopCountsTellTheTruth",
+        "tests/test_eval_preflight.py::TestTransportCrossCheck",
+        "tests/test_browser.py::TestProxyLaunchKwargs",
+        "-v"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8",
+        // runner 上没有显示器；本地想看有头浏览器就把这行删掉
+        "HEADLESS": "true"
+      },
+      "justMyCode": false
     }
   ]
 }

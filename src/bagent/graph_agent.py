@@ -54,6 +54,7 @@ from .agent import (
     RunResult,
     StepCallback,
     _action_signature,
+    loop_counts,
 )
 from .browser import BrowserSession
 from .config import Settings
@@ -400,17 +401,22 @@ class LangGraphReActAgent:
         # --- 动作指纹循环检测（与手写引擎同一套规则）---
         sig = _action_signature(action)
         trail = list(state.get("sig_trail") or []) + [sig]
-        repeats = trail.count(sig)
+        # 与手写引擎共用 loop_counts：判据仍是"累计"，但数字要如实 ——
+        # 原来这里写"连续 N 次"，实际算的是 trail.count()，日志与事实不符。
+        # 详见 agent.py 里 loop_counts 的说明与实测轨迹。
+        repeats, consecutive = loop_counts(trail, sig)
         out["sig_trail"] = trail
         if repeats >= LOOP_STOP_AT:
             out["error"] = (
-                f"检测到原地打转：动作 {sig} 重复 {repeats} 次且无进展，已熔断"
+                f"检测到原地打转：动作 {sig} 累计出现 {repeats} 次"
+                f"（其中末尾连续 {consecutive} 次）且无进展，已熔断"
             )
         elif repeats >= LOOP_WARN_AT:
             out["history"] = (
                 list(out["history"])
                 + [
-                    f"⚠ 严重警告：你已经连续 {repeats} 次执行 `{sig}`，"
+                    f"⚠ 严重警告：动作 `{sig}` 已经累计出现 {repeats} 次"
+                    f"（其中末尾连续 {consecutive} 次），"
                     f"页面没有任何进展。**禁止再执行这个动作**。"
                     f"你现在必须二选一：(a) 换一个完全不同的元素编号；"
                     f"(b) 直接调用 finish 给出结论。"

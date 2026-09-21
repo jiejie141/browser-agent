@@ -103,3 +103,98 @@ def test_teardown_timeout_default_and_bad_value(monkeypatch):
     assert Settings().teardown_timeout_seconds == 8.0
     monkeypatch.setenv("TEARDOWN_TIMEOUT_SECONDS", "不是数字")
     assert Settings().teardown_timeout_seconds == 8.0
+
+
+class TestProxyLaunchKwargs:
+    """代理判定必须只有一处。
+
+    这一组是被一个真实缺陷逼出来的：主路径 `BrowserSession` 读了
+    `BROWSER_PROXY`，可 `eval/run_eval.py` 的环境预检自己裸开浏览器
+    （`launch(headless=True)`，不带代理）。于是"配了代理"和"预检说连不上"
+    能同时成立 —— 站点在开跑前就被 skipped 剔除，代理白开。
+    修法是把判定抽成 `proxy_launch_kwargs`，两处共用；这里钉住它的行为。
+    """
+
+    def test_empty_returns_no_proxy_key(self):
+        """留空必须是"不传参"，不能是 `{"server": ""}`。
+
+        Playwright 会把空字符串当非法代理地址直接抛错 —— 这正是
+        当初主路径要写 `if proxy_server:` 的原因，不能丢。
+        """
+        from bagent.browser import proxy_launch_kwargs
+
+        st = Settings()
+        st.browser_proxy = ""
+        st.browser_proxy_bypass = ""
+        assert proxy_launch_kwargs(st) == {}
+
+    def test_whitespace_only_treated_as_empty(self):
+        from bagent.browser import proxy_launch_kwargs
+
+        st = Settings()
+        st.browser_proxy = "   "
+        assert proxy_launch_kwargs(st) == {}
+
+    def test_server_only(self):
+        from bagent.browser import proxy_launch_kwargs
+
+        st = Settings()
+        st.browser_proxy = "http://127.0.0.1:7890"
+        st.browser_proxy_bypass = ""
+        assert proxy_launch_kwargs(st) == {"proxy": {"server": "http://127.0.0.1:7890"}}
+
+    def test_bypass_included_when_set(self):
+        from bagent.browser import proxy_launch_kwargs
+
+        st = Settings()
+        st.browser_proxy = "http://127.0.0.1:7890"
+        st.browser_proxy_bypass = "baidu.com,weibo.com"
+        assert proxy_launch_kwargs(st) == {
+            "proxy": {
+                "server": "http://127.0.0.1:7890",
+                "bypass": "baidu.com,weibo.com",
+            }
+        }
+
+    def test_surrounding_whitespace_stripped(self):
+        from bagent.browser import proxy_launch_kwargs
+
+        st = Settings()
+        st.browser_proxy = "  http://127.0.0.1:7890  "
+        st.browser_proxy_bypass = "  baidu.com  "
+        out = proxy_launch_kwargs(st)
+        assert out["proxy"]["server"] == "http://127.0.0.1:7890"
+        assert out["proxy"]["bypass"] == "baidu.com"
+
+    def test_reads_from_env(self, monkeypatch):
+        """端到端：环境变量 → Settings → launch 参数。"""
+        from bagent.browser import proxy_launch_kwargs
+
+        monkeypatch.setenv("BROWSER_PROXY", "http://127.0.0.1:7891")
+        monkeypatch.setenv("BROWSER_PROXY_BYPASS", "qq.com")
+        out = proxy_launch_kwargs(Settings())
+        assert out == {"proxy": {"server": "http://127.0.0.1:7891", "bypass": "qq.com"}}
+
+    def test_session_and_preflight_share_the_judgement(self):
+        """两边必须调同一个函数 —— 这是本组存在的全部理由。
+
+        用源码级断言而不是行为断言：一旦有人在某处又自己拼一遍
+        `{"server": ...}`，这条会直接红，而不是等到某天"代理开了没用"。
+        """
+        import inspect
+
+        from bagent import browser as browser_mod
+
+        src = inspect.getsource(browser_mod.BrowserSession.__aenter__)
+        assert "proxy_launch_kwargs" in src, "主路径必须走共享判定"
+
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eval"))
+        import run_eval
+
+        pf_src = inspect.getsource(run_eval.preflight)
+        assert "proxy_launch_kwargs" in pf_src, "预检必须走共享判定"
+        assert "chromium.launch(headless=True, **launch_kwargs)" in pf_src, (
+            "预检的 launch 必须把代理参数带进去"
+        )

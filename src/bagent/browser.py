@@ -38,6 +38,35 @@ class SensitiveActionBlocked(RuntimeError):
     """人工拒绝了敏感操作。"""
 
 
+def proxy_launch_kwargs(settings: Settings) -> dict:
+    """把 settings 里的代理配置翻译成 Playwright 的 launch 参数。
+
+    抽成独立函数是**被一个真实缺陷逼出来的**，不是为复用而复用：
+
+    `eval/run_eval.py` 的环境预检自己开了一个无头浏览器去试连 URL，但它
+    只写了 `chromium.launch(headless=True)` —— **没带代理**。于是出现一种
+    自相矛盾的现场：`BROWSER_PROXY` 配好了、主路径（真正的 Agent 浏览器）
+    确实走了代理，可预检那一层还在用直连的口子；直连不通的站点被判成
+    "环境不可达"，任务在开跑前就被标成 `skipped` 剔除，**根本没机会跑**。
+    表现就是"代理开了也没用"，而且报告里看不出是被谁拦下的。
+
+    所以代理的判定必须只有一处。这里返回的字典直接 `**` 进 launch()。
+
+    留空 = 返回空字典 = 不加 `proxy` 键（不能写 `{"server": ""}`，
+    空字符串会被 Playwright 当成非法代理地址直接抛错）。
+    """
+    out: dict = {}
+    proxy_server = (getattr(settings, "browser_proxy", "") or "").strip()
+    if not proxy_server:
+        return out
+    proxy_cfg: dict = {"server": proxy_server}
+    bypass = (getattr(settings, "browser_proxy_bypass", "") or "").strip()
+    if bypass:
+        proxy_cfg["bypass"] = bypass
+    out["proxy"] = proxy_cfg
+    return out
+
+
 class BrowserSession:
     """管理一次浏览器会话的生命周期。
 
@@ -60,16 +89,15 @@ class BrowserSession:
             "args": ["--disable-blink-features=AutomationControlled"],
         }
         # 代理是可选的：留空就完全不加这个键，让浏览器用它的默认出口。
-        # 之所以不写 `proxy={"server": ""}`，是因为空字符串会被 Playwright
-        # 当成一个非法代理地址直接抛错 —— "不配置"必须是"不传参"。
-        proxy_server = (getattr(self.settings, "browser_proxy", "") or "").strip()
-        if proxy_server:
-            proxy_cfg: dict = {"server": proxy_server}
-            bypass = (getattr(self.settings, "browser_proxy_bypass", "") or "").strip()
-            if bypass:
-                proxy_cfg["bypass"] = bypass
-            launch_kwargs["proxy"] = proxy_cfg
-            log.info("浏览器出口走代理 %s（bypass=%s）", proxy_server, bypass or "-")
+        # 具体规则（含"为什么不能写空 server"）都在 proxy_launch_kwargs 里，
+        # 与 eval 侧的环境预检共用同一份判定，避免两处各写一遍再走偏。
+        launch_kwargs.update(proxy_launch_kwargs(self.settings))
+        if "proxy" in launch_kwargs:
+            log.info(
+                "浏览器出口走代理 %s（bypass=%s）",
+                launch_kwargs["proxy"]["server"],
+                launch_kwargs["proxy"].get("bypass", "-"),
+            )
         self._browser = await self._pw.chromium.launch(**launch_kwargs)
         self._context = await self._browser.new_context(
             viewport={"width": 1440, "height": 900},

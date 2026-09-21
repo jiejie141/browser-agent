@@ -45,6 +45,10 @@ class _SettingsStub:
     def validate(self) -> None:
         return None
 
+    # main() 会打印生效的模型/引擎（模型层消融要对账），桩得带上这两个字段。
+    llm_model = "stub-model"
+    engine = "handwritten"
+
 
 @pytest.fixture
 def no_llm_key(monkeypatch):
@@ -241,3 +245,254 @@ class TestPreflightGate:
 
 async def _fake_preflight(urls, **_kw):
     return {u: (False, "sandbox: 测试桩") for u in urls}
+
+
+class TestPreflightUsesSameEgressAsAgent:
+    """预检必须和正式跑**走同一个出口**。
+
+    这条是被真实缺陷逼出来的：`preflight` 原本自己裸开浏览器
+    （`chromium.launch(headless=True)`，不带代理参数），而正式跑的
+    `BrowserSession` 是读 `BROWSER_PROXY` 的。后果不是"慢一点"，
+    而是**结论反了**：代理配好、站点其实连得上，预检却按直连去试，
+    报"不可达"，任务在开跑前就被 skipped 剔除，一次都没跑。
+
+    所以这里用一个假的 Playwright 把 `launch()` 收到的参数截下来，
+    断言代理确实被传进去了 —— 不依赖真网络、不依赖真浏览器。
+    """
+
+    def _install_fake_playwright(self, monkeypatch, captured):
+        class _FakeResp:
+            status = 200
+
+        class _FakePage:
+            async def goto(self, url, **_kw):
+                return _FakeResp()
+
+        class _FakeBrowser:
+            async def new_page(self):
+                return _FakePage()
+
+            async def close(self):
+                captured["closed"] = True
+
+        class _FakeChromium:
+            async def launch(self, **kw):
+                captured.update(kw)
+                return _FakeBrowser()
+
+        class _FakePW:
+            chromium = _FakeChromium()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+        import playwright.async_api as pw_api
+
+        monkeypatch.setattr(pw_api, "async_playwright", lambda: _FakePW())
+
+    def test_proxy_from_settings_reaches_launch(self, monkeypatch):
+        captured: dict = {}
+        self._install_fake_playwright(monkeypatch, captured)
+        monkeypatch.setattr(
+            run_eval,
+            "get_settings",
+            lambda **_kw: _ProxySettings("http://127.0.0.1:7890", "baidu.com"),
+        )
+
+        res = asyncio.run(run_eval.preflight(["https://example.com/"], min_interval=0))
+
+        assert captured.get("proxy") == {
+            "server": "http://127.0.0.1:7890",
+            "bypass": "baidu.com",
+        }, "预检的浏览器必须带上 BROWSER_PROXY 的代理，否则它测的不是正式跑的那条路"
+        assert captured.get("headless") is True, "预检仍应无头运行"
+        assert res["https://example.com/"] == (True, "HTTP 200")
+
+    def test_no_proxy_configured_omits_key(self, monkeypatch):
+        """没配代理时不能凭空塞一个 proxy 键（空 server 会让 Playwright 抛错）。"""
+        captured: dict = {}
+        self._install_fake_playwright(monkeypatch, captured)
+        monkeypatch.setattr(
+            run_eval, "get_settings", lambda **_kw: _ProxySettings("", "")
+        )
+
+        asyncio.run(run_eval.preflight(["https://example.com/"], min_interval=0))
+
+        assert "proxy" not in captured
+
+
+class _ProxySettings:
+    """只带代理两个字段的替身（preflight 只读这两个）。"""
+
+    def __init__(self, proxy: str, bypass: str) -> None:
+        self.browser_proxy = proxy
+        self.browser_proxy_bypass = bypass
+
+
+class TestTransportCrossCheck:
+    """把「不可达」拆成两类 —— 两类处置完全不同。
+
+    本机实测的真实现象（12 个真实站点逐条核过）：同一条链路、同一个出口 IP，
+    三种客户端结论不一致 ——
+
+    | 客户端 | TLS 栈 | 豆瓣 |
+    |---|---|---|
+    | chromium | BoringSSL | `ERR_CONNECTION_CLOSED` |
+    | Python urllib | OpenSSL | `SSL: UNEXPECTED_EOF_WHILE_READING` |
+    | curl | schannel | **`200` + 64416 字节真实正文** |
+
+    所以**区分点在 TLS 栈，不是"浏览器 vs 非浏览器"**。这也是为什么
+    通道要跑两条、而且必须包含 curl（它与另外两条不是同一个栈）。
+    只看"浏览器不通、urllib 也不通"会误判成"站点挂了" —— 豆瓣、
+    东方财富的站点都是好的。
+
+    已经逐一排除的解释：不是沙箱（内外一致）、不是 IPv6（无 AAAA）、
+    代理无用（直连 5/12，走代理还是 5/12，失败的是同一批）。
+    """
+
+    def test_urllib_http_error_still_counts_as_reachable(self, monkeypatch):
+        """403/404 说明链路是通的 —— 这里只问通不通，不问内容对不对。"""
+        import urllib.error
+        import urllib.request
+
+        def _raise(*_a, **_kw):
+            raise urllib.error.HTTPError("https://x/", 403, "Forbidden", {}, None)
+
+        monkeypatch.setattr(urllib.request, "urlopen", _raise)
+        ok, detail = run_eval._probe_urllib("https://x/", 5.0)
+        assert ok is True and "403" in detail
+
+    def test_urllib_connection_error_counts_as_unreachable(self, monkeypatch):
+        import urllib.request
+
+        def _raise(*_a, **_kw):
+            raise OSError("Connection refused")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _raise)
+        ok, _detail = run_eval._probe_urllib("https://x/", 5.0)
+        assert ok is False
+
+    def test_curl_missing_is_reported_not_crashed(self, monkeypatch):
+        """没装 curl 时要降级成一条结论，不能抛。"""
+        import shutil
+
+        monkeypatch.setattr(shutil, "which", lambda _n: None)
+        ok, detail = run_eval._probe_curl("https://x/", 5.0)
+        assert ok is False and "未安装" in detail
+
+    def test_curl_302_counts_as_reachable(self, monkeypatch):
+        """微博/当当对 curl 就是回 302 —— 服务器有响应就是通。"""
+        import subprocess
+
+        def _fake_run(*_a, **_kw):
+            class _CP:
+                stdout = b"302"
+                stderr = b""
+
+            return _CP()
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        ok, detail = run_eval._probe_curl("https://x/", 5.0)
+        assert ok is True and "302" in detail
+
+    def test_curl_000_is_failure(self, monkeypatch):
+        import subprocess
+
+        def _fake_run(*_a, **_kw):
+            class _CP:
+                stdout = b"000"
+                stderr = b"curl: (35) schannel: failed to receive handshake"
+
+            return _CP()
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        ok, detail = run_eval._probe_curl("https://x/", 5.0)
+        assert ok is False and "000" in detail
+
+    def test_any_channel_ok_means_site_is_fine(self, monkeypatch):
+        """curl 通、urllib 不通 → 站点是好的。这正是豆瓣的真实现场。"""
+        monkeypatch.setattr(run_eval, "_probe_urllib", lambda *a: (False, "URLError"))
+        monkeypatch.setattr(run_eval, "_probe_curl", lambda *a: (True, "curl 200 64416B"))
+        ok, detail = run_eval.transport_reachable("https://movie.douban.com/top250")
+        assert ok is True
+        assert "64416B" in detail and "urllib" in detail
+
+    def test_both_channels_down(self, monkeypatch):
+        monkeypatch.setattr(run_eval, "_probe_urllib", lambda *a: (False, "URLError"))
+        monkeypatch.setattr(run_eval, "_probe_curl", lambda *a: (False, "curl 000"))
+        ok, _detail = run_eval.transport_reachable("https://x/")
+        assert ok is False
+
+    def test_annotate_labels_the_two_cases(self, monkeypatch):
+        calls: list[str] = []
+
+        def _fake(url, timeout=8.0):
+            calls.append(url)
+            return ("site-ok" in url, "curl 200 1B" if "site-ok" in url else "curl 000")
+
+        monkeypatch.setattr(run_eval, "transport_reachable", _fake)
+        skipped = [
+            {"id": "a", "url": "https://site-ok/", "reason": "ERR_CONNECTION_CLOSED"},
+            {"id": "b", "url": "https://all-down/", "reason": "ERR_CONNECTION_CLOSED"},
+        ]
+        run_eval.annotate_transport(skipped)
+
+        assert skipped[0]["transport_ok"] is True
+        assert "站点是好的" in skipped[0]["diagnosis"]
+        assert skipped[1]["transport_ok"] is False
+        assert "站点/网络问题" in skipped[1]["diagnosis"]
+
+    def test_same_url_only_probed_once(self, monkeypatch):
+        """r02/r03 指向同一个 douban URL，别把它连试两次。"""
+        calls: list[str] = []
+
+        def _fake(url, timeout=8.0):
+            calls.append(url)
+            return False, "curl 000"
+
+        monkeypatch.setattr(run_eval, "transport_reachable", _fake)
+        skipped = [
+            {"id": "r02", "url": "https://movie.douban.com/top250", "reason": "x"},
+            {"id": "r03", "url": "https://movie.douban.com/top250", "reason": "x"},
+        ]
+        run_eval.annotate_transport(skipped)
+        assert len(calls) == 1, "同一 URL 只该探一次"
+        assert skipped[1].get("transport_ok") is False
+
+    def test_report_surfaces_site_is_fine_row(self, capsys, monkeypatch):
+        # 测试环境里 rich 探测不到终端宽度，会把列挤到看不清。
+        # 这里给一个够宽的控制台，测的是"有没有这一列"，不是"排得好看不好看"。
+        from rich.console import Console
+
+        monkeypatch.setattr(run_eval, "console", Console(width=220))
+        rows = [_row("a", True)]
+        skipped = [
+            {
+                "id": "r03",
+                "url": "https://movie.douban.com/top250",
+                "reason": "net::ERR_CONNECTION_CLOSED",
+                "transport": "curl 200 64416B / urllib ✗ URLError",
+                "transport_ok": True,
+                "diagnosis": "站点是好的：出口在区分客户端",
+            }
+        ]
+        run_eval.print_report(rows, run_eval.summarize(rows, skipped), skipped)
+        out = capsys.readouterr().out
+        assert "非浏览器通道" in out
+        assert "64416B" in out and "站点是好的" in out
+
+    def test_report_handles_row_without_transport_fields(self, capsys):
+        """老调用方（测试桩/手工构造）不带这几个键时不能崩。"""
+        rows = [_row("a", True)]
+        skipped = [{"id": "b", "url": "https://y/", "reason": "boom"}]
+        run_eval.print_report(rows, run_eval.summarize(rows, skipped), skipped)
+        assert "环境预检" in capsys.readouterr().out
+
+    def test_real_sites_file_declares_network_dependence(self):
+        """真实站点集必须继续声明网络依赖，否则预检会被关掉。"""
+        data = json.loads((ROOT / "tasks" / "real_sites.json").read_text(encoding="utf-8"))
+        assert data.get("_network_dependent") is True
+        assert len(data["tasks"]) == 12

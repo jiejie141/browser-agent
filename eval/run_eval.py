@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -46,7 +47,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from bagent.agent import ReActAgent, new_run_dir  # noqa: E402
-from bagent.browser import open_browser  # noqa: E402
+from bagent.browser import open_browser, proxy_launch_kwargs  # noqa: E402
 from bagent.config import get_settings  # noqa: E402
 from bagent.llm import build_client  # noqa: E402
 from bagent.siteprobe import looks_like_throttle  # noqa: E402
@@ -66,6 +67,11 @@ async def preflight(urls: list[str], *, min_interval: float = 1.0) -> dict[str, 
     —— 登录墙、验证码、空壳页面都算**可达**，它们是 Agent 该处理的情形，
     不属于环境问题。只有连接层失败（`looks_like_throttle` 认得的那一类）
     才判为不可达。
+
+    ⭐ 出口必须与正式跑**完全一致**，所以这里用 `proxy_launch_kwargs` 取代理
+    参数，而不是自己裸开一个浏览器。之前就是个裸的 `launch(headless=True)`：
+    配了 `BROWSER_PROXY` 的站点在预检里被判不可达 → 任务还没跑就被 skipped。
+    预检的口径要是和主路径不一样，"环境不可达"这个结论就没有意义了。
     """
     out: dict[str, tuple[bool, str]] = {}
     targets = [u for u in dict.fromkeys(urls) if u and not u.startswith("file://")]
@@ -74,8 +80,18 @@ async def preflight(urls: list[str], *, min_interval: float = 1.0) -> dict[str, 
 
     from playwright.async_api import async_playwright
 
+    settings = get_settings(refresh=True)
+    launch_kwargs = proxy_launch_kwargs(settings)
+    if "proxy" in launch_kwargs:
+        console.print(
+            f"[dim]预检与正式跑走同一出口：代理 {launch_kwargs['proxy']['server']}"
+            f"（bypass={launch_kwargs['proxy'].get('bypass', '-')}）[/dim]"
+        )
+    else:
+        console.print("[dim]预检与正式跑走同一出口：直连（未配 BROWSER_PROXY）[/dim]")
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, **launch_kwargs)
         try:
             page = await browser.new_page()
             for i, url in enumerate(targets):
@@ -109,6 +125,125 @@ REFUSAL_MARKERS = (
     "无法", "不能", "没有", "不存在", "做不到", "不具备", "不支持",
     "找不到", "不可用", "没有找到", "无法完成", "需要登录", "无登录",
 )
+
+
+def _probe_urllib(url: str, timeout: float) -> tuple[bool, str]:
+    """非浏览器通道 A：标准库 urllib（Windows 上走 **OpenSSL**）。"""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            resp.read(1)
+            return True, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx 也算"连得上" —— 这里问的是链路通不通，不是内容对不对。
+        return True, f"HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}"
+
+
+def _probe_curl(url: str, timeout: float) -> tuple[bool, str]:
+    """非浏览器通道 B：本机 curl。
+
+    ⭐ 为什么非要这一条：本机 curl 走 Windows 自带的 **schannel**，
+    跟 chromium（BoringSSL）和 Python（OpenSSL）**不是同一个 TLS 栈**。
+    而实测下来，区分点恰恰在 TLS 栈上 —— 同一时刻访问豆瓣：
+
+    | 客户端 | TLS 栈 | 结果 |
+    |---|---|---|
+    | chromium | BoringSSL | `ERR_CONNECTION_CLOSED` |
+    | Python urllib | OpenSSL | `SSL: UNEXPECTED_EOF_WHILE_READING` |
+    | curl | schannel | **`200` + 64416 字节真实正文** |
+
+    只看"浏览器不通、urllib 也不通"就判成"站点/网络问题"是**错的** ——
+    豆瓣、东方财富的站点都是好的。多一条 curl 才能把这两类分开。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("curl") is None:
+        return False, "curl 未安装"
+
+    fd, path = tempfile.mkstemp(suffix=".curlout")
+    os.close(fd)
+    try:
+        cp = subprocess.run(  # noqa: S603
+            [
+                "curl", "-sS", "-o", path, "-w", "%{http_code}",
+                "--max-time", str(int(timeout)), url,
+            ],
+            capture_output=True,
+            timeout=timeout + 8,
+        )
+        code = cp.stdout.decode("ascii", "replace").strip()
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if code and code != "000":
+            # 302 之类也算"连得上"：服务器确实回应了。
+            return True, f"curl {code} {size}B"
+        first = (cp.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return False, f"curl 000{('：' + first[0][:32]) if first else ''}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"curl {type(exc).__name__}"
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def transport_reachable(url: str, timeout: float = 8.0) -> tuple[bool, str]:
+    """用**非浏览器通道**再试同一个 URL，返回 `(是否有通道连通, 说明)`。
+
+    这不是重复劳动，是被本机一个真实现象逼出来的：
+    有一批站点在 chromium 里稳定 `net::ERR_CONNECTION_CLOSED`，
+    而同一条链路、同一个出口 IP 上，curl 能拿到 `200` 和真实正文。
+
+    已经逐一排除的解释（都做过对照）：
+      - 不是沙箱造成的：沙箱内、沙箱外结果完全一样；
+      - 不是 IPv6 解析问题：域名只有 A 记录、无 AAAA，`curl -4` 照样 200；
+      - 开代理不改善：直连 5/12、走代理 5/12，失败的还是同一批站。
+
+    剩下的解释是**出口对客户端 TLS 实现有区分**（中间设备/安全软件那类），
+    所以这里跑**两条不同 TLS 栈**的通道（见 `_probe_urllib` / `_probe_curl`），
+    把"站点挂了"和"只有某些客户端连不上"分开 —— 两者处置完全不同：
+      - 有通道能通 → 站点是好的，换客户端/换机器就好；
+      - 全都不通   → 疑似站点/网络问题，换网络再测。
+    """
+    u_ok, u_detail = _probe_urllib(url, timeout)
+    c_ok, c_detail = _probe_curl(url, timeout)
+    detail = f"{c_detail} / urllib {'✓' if u_ok else '✗ ' + u_detail}"
+    return (u_ok or c_ok), detail
+
+
+def annotate_transport(skipped: list[dict]) -> None:
+    """给被跳过的任务补一条非浏览器通道的结论（就地写入 `transport`）。
+
+    只对**已经被判定不可达**的少数 URL 做，开销可忽略；而且它回答的是
+    "接下来该怎么办"，不是"谁对谁错"。
+    """
+    seen: dict[str, tuple[bool, str]] = {}
+    for s in skipped:
+        url = s.get("url", "")
+        if url not in seen:
+            seen[url] = (
+                transport_reachable(url) if url else (False, "无 URL")
+            )
+        ok, detail = seen[url]
+        s["transport"] = detail
+        s["transport_ok"] = ok
+        if ok:
+            s["diagnosis"] = "站点是好的：出口在区分客户端"
+        else:
+            s["diagnosis"] = "疑似站点/网络问题"
 
 
 def judge(task: dict, result) -> tuple[bool, str]:
@@ -233,6 +368,9 @@ async def run_task(task: dict, settings, max_steps: int | None) -> dict:
         "grounded": bool(getattr(result, "grounded", False)),
         "grounding_retries": int(getattr(result, "grounding_retries", 0) or 0),
         "grounding_note": getattr(result, "grounding_note", ""),
+        # 哪把模型跑的。做**模型层消融**时必须能只看结果文件就知道是谁跑的 ——
+        # 否则两份结果放一起比，谁也说不清差异来自模型还是来自别的改动。
+        "model": getattr(settings, "llm_model", ""),
     }
 
 
@@ -351,10 +489,20 @@ def print_report(
 
     if skipped:
         sk = Table(show_header=True, header_style="bold yellow", title="环境预检未通过（未计分）")
-        for col in ("ID", "URL", "原因"):
+        for col in ("ID", "URL", "非浏览器通道", "原因", "判断"):
             sk.add_column(col)
         for s in skipped:
-            sk.add_row(s["id"], s["url"][:52], s["reason"][:58])
+            if s.get("transport_ok"):
+                tr = f"[yellow]能通（{s.get('transport', '')}）[/yellow]"
+            else:
+                tr = f"[dim]也不通（{s.get('transport', '-')}）[/dim]"
+            sk.add_row(
+                s["id"],
+                s["url"][:44],
+                tr,
+                s["reason"][:44],
+                s.get("diagnosis", "")[:30],
+            )
         console.print(sk)
 
     table = Table(show_header=True, header_style="bold", title="逐次结果（自动判分）")
@@ -471,6 +619,12 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = get_settings(refresh=True)
     settings.validate()
+    # 打出来是为了**模型层消融**能对账：两份结果比之前先看清模型号，
+    # 才不会把"换了模型"的差异误记成"改了代码"的效果。
+    console.print(
+        f"[dim]模型 {settings.llm_model} ｜ 引擎 {settings.engine} "
+        f"｜ 任务集 {Path(args.task_file).name}[/dim]"
+    )
 
     data = json.loads(Path(args.task_file).read_text(encoding="utf-8"))
     tasks = data.get("tasks", data)
@@ -499,10 +653,19 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 skipped.append({"id": t["id"], "url": t["url"], "reason": reason})
         if skipped:
+            # 补一条非浏览器通道的结论：把「不可达」拆成
+            # 「站点/网络问题」和「只有浏览器被拦」——两类处置完全不同。
+            annotate_transport(skipped)
             console.print(
                 f"[yellow]{len(skipped)}/{len(tasks)} 个任务因环境不可达被跳过，"
                 "不计入失败（但也不会让成功率显得更好看）[/yellow]"
             )
+            _only_browser = sum(1 for s in skipped if s.get("transport_ok"))
+            if _only_browser:
+                console.print(
+                    f"[yellow]其中 {_only_browser} 个是**有非浏览器通道能通**、"
+                    "只有 chromium 连不上 —— 站点是好的，是出口在区分客户端[/yellow]"
+                )
         tasks = runnable
 
     runs: list[dict] = []
