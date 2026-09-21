@@ -110,6 +110,14 @@ class Settings:
         default_factory=lambda: _get("BROWSER_PROXY_BYPASS")
     )
 
+    # 站点探测时两次导航之间的最小间隔（秒）。
+    # 为什么要节流：`--probe-sites` 会连着访问几十个站点，中间没有任何停顿。
+    # 实测这样跑会把出口打限流 —— 一次全量探测 64 个站，最后只剩 2 个可达，
+    # 而单独探其中 5 个时百度是正常的。**结论会飘，探测本身把自己搞坏了。**
+    probe_min_interval_seconds: float = field(
+        default_factory=lambda: _get_float("PROBE_MIN_INTERVAL_SECONDS", 1.5)
+    )
+
     # ---- 离线替身 ----
     # True 表示本次运行不调用真实模型：Agent 据此把成本计为 0
     # （离线替身的 token 是按字符估的，乘单价会算出一个并不存在的花费）。

@@ -84,11 +84,38 @@
       "justMyCode": false
     },
     {
-      "name": "⑤ 跑评测集",
+      "name": "⑤ 跑评测集（基线 6 任务）",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/eval/run_eval.py",
       "args": [],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": { "PYTHONIOENCODING": "utf-8" },
+      "justMyCode": false
+    },
+    {
+      // 基线只有 6 个任务、跑一次得不出可信数字：实测三轮分别是 3/6、2/6、3/6。
+      // 这个配置就是用来量方差的 —— 跑完看 pass@3 与 pass^3 的差距，
+      // 两者差得多说明是稳定性问题，不是能力问题。
+      "name": "⑤b 基线 × 3 轮（量稳定性 pass@3 / pass^3）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval/run_eval.py",
+      "args": ["--repeat", "3"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": { "PYTHONIOENCODING": "utf-8" },
+      "justMyCode": false
+    },
+    {
+      // 真实站点集。会自动先做环境预检，连不上的任务标 skipped 不计分 ——
+      // 这样"模型不会做"和"这台机器连不上"不会混成同一个数字。
+      "name": "⑤c 跑真实站点评测集（含环境预检）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval/run_eval.py",
+      "args": ["--task-file", "tasks/real_sites.json"],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "env": { "PYTHONIOENCODING": "utf-8" },

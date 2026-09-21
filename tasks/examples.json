@@ -1,5 +1,6 @@
 {
-  "_comment": "任务集。kind=normal 表示应该完成；kind=counter 是反例，考察 Agent 能否识别出做不到并主动放弃（对应简历里的『拒答』）。must_contain 用于自动判分，全部命中才算通过；counter 任务用 expect_no_completion 判定。",
+  "_comment": "任务集。kind=normal 表示应该完成；kind=counter 是反例，考察 Agent 能否识别出做不到并主动放弃（对应简历里的『拒答』）。must_contain 用于自动判分，命中任一关键词即算通过；counter 任务用 expect_no_completion 判定。",
+  "_network_note": "⭐ 这里的 URL 是**真站点**（quotes/books.toscrape.com 是专门给人练爬虫的稳定站点，bing 是搜索页），不是本地文件 —— 别被『玩具站』这个说法误导，它们一样走网络。但本任务集**故意不开**环境预检（没有 `_network_dependent`）：它是简历里那条『6 任务集 / 端到端 3/6』的固定判分基线，分母一旦会因为网络抖动而变，这条基线就没法对账了。真遇到网络问题时用 `python eval/run_eval.py --preflight` 显式打开。",
   "tasks": [
     {
       "id": "t01",

@@ -24,15 +24,38 @@ from .models import Element, PageState
 
 log = logging.getLogger(__name__)
 
-# 一帧最多收集多少个可交互元素。
+# 一帧最多给多少个元素编号。
 # 这个数字直接决定 prompt 长度 → 决定每一跳的成本。调大要付钱。
 MAX_ELEMENTS = 100
 
-# 收集可交互元素的 JS。在浏览器上下文里执行。
+# 扫描上限：先把候选都扫出来（**不编号**），再决定给谁编号。
+# 必须比 MAX_ELEMENTS 大得多 —— 只扫 100 个的话侧栏早就把名额占满了，
+# "筛选"就无从谈起。
+SCAN_CAP = 500
+
+# 导航 / 侧栏 / 页脚最多能占用多少个编号。
+# 没有这条上限，就是本模块改造前的行为：侧栏分类链接吃光 100 个名额，
+# 正文里的搜索结果一个都进不来 —— 表现是"页面上明明有结果，
+# Agent 却说不出来"。25 是经验值：够放下搜索框、主导航和分页，
+# 又挡得住"几百个分类链接"。
+CHROME_QUOTA = 25
+
+# 收集候选元素的 JS（第一趟，只扫不编号）。在浏览器上下文里执行。
+#
+# ⚠️ maxScan 必须由 Python 侧显式传进来，别指望"不传就是默认值"：
+# Playwright 在调用方不给参数时传进来的是 **null 而不是 undefined**，
+# 于是 `cands.length >= maxScan` 里的 `0 >= null` 为真，循环第一次就 break，
+# 候选恒为空 —— 表现是"页面上明明有链接，却一个元素都抽不到"。
+# 这里再加一层 typeof 判断，即使将来有人忘了传参，也只是退化成"不设上限"，
+# 而不是静默返回空列表（静默返回空是最难查的一种失败）。
 _COLLECT_JS = """
-() => {
-  const MAX = %d;
-  const out = [];
+(maxScan) => {
+  const cap = (typeof maxScan === 'number' && maxScan > 0) ? maxScan : Infinity;
+  const CHROME_SEL = 'nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], [role="complementary"]';
+  const MAIN_SEL = 'main, [role="main"], article, #content, #main, .content, .article, .post, .detail';
+  // 语义标签缺失时的兜底：很多站只用 class/id 命名，不写 <nav> / <main>
+  const CHROME_WORDS = /(^|[-_ ])(nav|navbar|navigation|menu|sidebar|aside|footer|header|topbar|toolbar|breadcrumb|catalog|category|categories|pagination|pager|tabbar)([-_ ]|$)/i;
+  const MAIN_WORDS = /(^|[-_ ])(main|content|article|post|detail|result|results|list|feed|goods|item)([-_ ]|$)/i;
 
   // 清掉上一次的标记，避免 ref 编号错位到已经消失的元素上
   document.querySelectorAll('[data-ba-ref]').forEach(el => el.removeAttribute('data-ba-ref'));
@@ -68,45 +91,189 @@ _COLLECT_JS = """
     return String(raw).trim().replace(/\\s+/g, ' ').slice(0, 60);
   };
 
-  let ref = 0;
+  const regionOf = (el) => {
+    if (el.closest(CHROME_SEL)) return 'chrome';
+    if (el.closest(MAIN_SEL)) return 'main';
+    let node = el, depth = 0, mainHit = false;
+    while (node && node !== document.body && depth < 6) {
+      const cls = (typeof node.className === 'string') ? node.className : '';
+      const sig = String(node.id || '') + ' ' + cls;
+      if (CHROME_WORDS.test(sig)) return 'chrome';
+      if (MAIN_WORDS.test(sig)) mainHit = true;
+      node = node.parentElement;
+      depth += 1;
+    }
+    return mainHit ? 'main' : 'neutral';
+  };
+
+  const cands = [];
   for (const el of nodes) {
-    if (out.length >= MAX) break;
+    if (cands.length >= cap) break;
     if (!visible(el)) continue;
-    ref += 1;
-    el.setAttribute('data-ba-ref', String(ref));
-    out.push({
-      ref: ref,
+    cands.push({
+      el: el,
       tag: el.tagName.toLowerCase(),
       text: label(el),
       aria: String(el.getAttribute('aria-label') || '').slice(0, 60),
-      placeholder: String(el.getAttribute('placeholder') || '').slice(0, 60)
+      placeholder: String(el.getAttribute('placeholder') || '').slice(0, 60),
+      region: regionOf(el)
     });
   }
-  return out;
-}
-""" % MAX_ELEMENTS
 
-_BODY_TEXT_JS = "() => (document.body ? document.body.innerText : '')"
+  // 元素引用挂到 window 上，第二趟按分配结果编号时复用同一批 DOM 节点。
+  // 两次 querySelectorAll 之间页面若发生变动，编号就会错位到别的元素上——
+  // 那是最难查的一类 bug（点击"第 3 个"却点到别的东西）。
+  window.__ba_cands = cands.map(c => c.el);
+  return cands.map((c, i) => ({
+    idx: i, tag: c.tag, text: c.text,
+    aria: c.aria, placeholder: c.placeholder, region: c.region
+  }));
+}
+"""
+
+# 回写编号的 JS（第二趟）。只对选中的候选打 data-ba-ref，其余保持无标记。
+_APPLY_JS = """
+(pairs) => {
+  const els = window.__ba_cands || [];
+  let n = 0;
+  for (const p of pairs) {
+    const el = els[p[0]];
+    if (!el) continue;
+    el.setAttribute('data-ba-ref', String(p[1]));
+    n += 1;
+  }
+  return n;
+}
+"""
+
+# 正文抽取：**优先主内容区**。
+# 直接取 document.body.innerText 会把导航、侧栏分类、页脚版权全混进来，
+# 几千字里正文只占一小段 —— 既费 token，又让模型抓不住重点。
+_BODY_TEXT_JS = """
+() => {
+  const MAIN_SEL = 'main, [role="main"], article, #content, #main, .content, .article, .post, .detail';
+  const main = document.querySelector(MAIN_SEL);
+  if (main) {
+    const t = String(main.innerText || '').trim();
+    // 太短说明这个 landmark 不是真正的内容容器，回退整页
+    if (t.length >= 200) return t;
+  }
+  return document.body ? document.body.innerText : '';
+}
+"""
+
+
+def region_of(candidates: list[dict], region: str) -> list[dict]:
+    """按区域挑候选。
+
+    **未知 / 缺失的 region 一律归到 neutral**，而不是丢掉。
+    静默丢弃比归错档更糟：丢掉意味着"页面上有东西但 Agent 从来看不见"，
+    而且完全没有任何迹象。JS 侧一旦改了字段名，这里就会集体丢元素 ——
+    归到中性至少还能被编号、被模型看到。
+    """
+    if region == "neutral":
+        return [c for c in candidates if c.get("region") not in ("main", "chrome")]
+    return [c for c in candidates if c.get("region") == region]
+
+
+def allocate(
+    candidates: list[dict],
+    max_elements: int = MAX_ELEMENTS,
+    chrome_quota: int = CHROME_QUOTA,
+) -> list[tuple[int, int]]:
+    """决定给哪些候选编号，返回 [(候选下标, 编号), ...]。
+
+    这就是本次改造的核心策略：
+
+      1. **主内容区**的元素先占名额；
+      2. **中性区**（判断不出归属的）其次；
+      3. **导航 / 侧栏 / 页脚**最后，且最多占 `chrome_quota` 个 ——
+         没有这条上限就是改造前的行为：侧栏分类链接吃光 100 个名额；
+      4. 只有**主内容区和中性区都为空**时才取消 chrome 上限（导航站、目录页，
+         那种页面上链接本身就是内容）。
+
+    第 4 条的判定条件刻意写成"两者都为空"，而不是"数量少于某个阈值"：
+    阈值写法会误伤**正是要修的那个场景**（"5 条搜索结果 + 200 个侧栏链接"，
+    主内容少但确实是内容），把上限一解除，侧栏又把预算吃光了。
+
+    编号在最后**按文档顺序重排**，而不是按优先级排：模型读到的顺序要跟
+    页面从上到下一致，"第一条搜索结果"这类表述才有意义。
+    被筛掉是"不编号"，不是"挪到后面"。
+
+    剩余额度**刻意不补给 chrome**：内容都收全之后再塞几十个导航链接，
+    只增加 prompt 成本、不增加信息量。
+    """
+    keep_main = region_of(candidates, "main")
+    keep_neutral = region_of(candidates, "neutral")
+    keep_chrome = region_of(candidates, "chrome")
+
+    if not keep_main and not keep_neutral:
+        chrome_quota = max_elements
+
+    picked = list(keep_main[:max_elements])
+    picked += keep_neutral[: max(0, max_elements - len(picked))]
+    room = max(0, max_elements - len(picked))
+    picked += keep_chrome[: min(chrome_quota, room)]
+
+    picked.sort(key=lambda c: c.get("idx", 0))
+    return [(int(c["idx"]), i + 1) for i, c in enumerate(picked)]
 
 
 async def extract_elements(page: Page) -> list[Element]:
-    """通道 A：抽取可交互元素并打上编号。"""
+    """通道 A：抽取可交互元素并打上编号。
+
+    分两趟：
+      1. 扫（不编号）→ 拿到候选 + 区域归属；
+      2. 在 Python 里按区域配额决定给谁编号（allocate 是纯函数，可单测）；
+      3. 回写编号。
+
+    **为什么非要分两趟**：分配策略放在 JS 里就只能靠跑真实浏览器来验证，
+    而"侧栏抢名额"这类 bug 恰恰只在真实页面上暴露，定位成本极高。
+    搬到 Python 之后，用几条构造的候选就能把策略钉死。
+    """
     try:
-        raw = await page.evaluate(_COLLECT_JS)
+        # SCAN_CAP 必须显式传 —— 见 _COLLECT_JS 顶部的注释：
+        # 不传参时 Playwright 给的是 null，会让候选直接变成空列表。
+        raw = await page.evaluate(_COLLECT_JS, SCAN_CAP)
     except Exception as exc:  # 页面正在跳转时 evaluate 会失败，属于正常抖动
         log.warning("抽取元素失败（页面可能正在导航）: %s", exc)
         return []
 
+    cands = [c for c in (raw or []) if isinstance(c, dict) and "idx" in c]
+    if not cands:
+        return []
+
+    pairs = allocate(cands)
+    try:
+        await page.evaluate(_APPLY_JS, [[idx, ref] for idx, ref in pairs])
+    except Exception as exc:
+        log.warning("回写元素编号失败: %s", exc)
+        return []
+
+    by_idx = {c["idx"]: c for c in cands}
     elements: list[Element] = []
-    for item in raw or []:
+    for idx, ref in pairs:
+        c = by_idx.get(idx)
+        if c is None:
+            continue
         try:
-            elements.append(Element(**item))
+            elements.append(
+                Element(
+                    ref=ref,
+                    tag=str(c.get("tag", "")),
+                    text=str(c.get("text", "")),
+                    aria=str(c.get("aria", "")),
+                    placeholder=str(c.get("placeholder", "")),
+                    region=str(c.get("region", "neutral")),
+                )
+            )
         except Exception:
             continue
     return elements
 
 
 async def extract_body_text(page: Page, max_chars: int = 4000) -> str:
+    """读正文。优先主内容区，避免几千字的导航/页脚把正文淹掉。"""
     try:
         text = await page.evaluate(_BODY_TEXT_JS) or ""
     except Exception:

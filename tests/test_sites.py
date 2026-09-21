@@ -30,12 +30,16 @@ from bagent.sites import (
 )
 from bagent.siteprobe import (
     DEFAULT_KEYWORD,
+    THROTTLE_HINTS,
     ProbeResult,
+    ProbeRun,
     classify,
     load,
+    looks_like_throttle,
     merge,
     save,
     summarize,
+    throttle_note,
 )
 
 
@@ -214,16 +218,19 @@ def test_summarize_counts_by_verdict():
     assert s["total"] == 2
     assert s["accessible"] == 1
     assert s["by_verdict"]["login_redirect"] == 1
+    assert "connection_errors" in s, "连接层失败必须单列，否则会被读成站点挂了"
 
 
 def test_save_and_load_roundtrip(tmp_path):
     path = tmp_path / "site_probe.json"
-    save(_fake_results(), path, keyword="测试词")
+    save(ProbeRun(results=_fake_results(), keyword="测试词"), path)
     data = load(path)
     assert data is not None
     assert data["keyword"] == "测试词"
     assert data["summary"]["total"] == 2
     assert {r["key"] for r in data["results"]} == {"baidu", "jd"}
+    assert data["trustable"] is True
+    assert data["aborted"] is False
 
 
 def test_load_missing_or_corrupt_returns_none(tmp_path):
@@ -316,3 +323,80 @@ def test_perception_call_signatures_match_usage():
         f"extract_elements 的参数变成 {list(sig_elem.parameters)} 了，"
         "siteprobe 的调用要同步"
     )
+
+
+# ---------------------------------------------------------------------------
+# 限流识别与"这份结果可不可信"
+#
+# 这一组守的是**一次真实的误报**：全量探 64 个站点时 61 个报 error，
+# 而单独探其中 5 个时百度明明是好的。原因是连着轰太密，把出口打限流了。
+# 如果不区分"连接层失败"和"站点真的不可用"，报告就会变成
+# "61 个站点打不开"——一句完全错误、但看上去很确定的结论。
+# ---------------------------------------------------------------------------
+def test_looks_like_throttle_recognises_connection_failures():
+    assert looks_like_throttle("Error: Page.goto: net::ERR_CONNECTION_CLOSED at https://x/")
+    assert looks_like_throttle("ERR_PROXY_CONNECTION_FAILED")
+    assert looks_like_throttle("net::ERR_TIMED_OUT")
+    assert looks_like_throttle("429 Too Many Requests")
+
+
+def test_looks_like_throttle_rejects_site_level_verdicts():
+    """站点自己的状态（登录墙、空页面）不能被误判成限流 ——
+    那会让我们对真正需要用户处理的问题视而不见。"""
+    assert not looks_like_throttle("")
+    assert not looks_like_throttle("login_wall")
+    assert not looks_like_throttle("empty")
+
+
+def test_every_throttle_hint_is_actually_matched():
+    for h in THROTTLE_HINTS:
+        assert looks_like_throttle(h), f"{h} 写在表里却匹配不到，等于没写"
+
+
+def _conn_error(key: str) -> ProbeResult:
+    return ProbeResult(key=key, name=key, category="c", url="https://x/",
+                       verdict="error", error="net::ERR_CONNECTION_CLOSED at https://x/")
+
+
+def test_throttle_note_fires_when_connection_errors_dominate():
+    rows = [_conn_error(f"k{i}") for i in range(8)] + [
+        ProbeResult(key="ok", name="ok", category="c", url="u", verdict="accessible")
+    ]
+    note = throttle_note(rows)
+    assert note, "连接层失败占大头时必须给出警告"
+    assert "不可用" not in note.split("而不是")[0], "不能把连接层失败说成站点不可用"
+    assert "出口" in note
+
+
+def test_throttle_note_silent_when_errors_are_few():
+    rows = [
+        ProbeResult(key="a", name="a", category="c", url="u", verdict="accessible"),
+        ProbeResult(key="b", name="b", category="c", url="u", verdict="login_wall"),
+        ProbeResult(key="c", name="c", category="c", url="u", verdict="accessible"),
+        ProbeResult(key="d", name="d", category="c", url="u", verdict="empty"),
+    ]
+    assert throttle_note(rows) == ""
+
+
+def test_throttle_note_empty_list_is_safe():
+    assert throttle_note([]) == ""
+
+
+def test_probe_run_flags_aborted_run_as_untrustable():
+    run = ProbeRun(results=[_conn_error("a")], aborted=True, remaining=40)
+    assert run.trustable is False
+    assert "不能当站点可用性结论" in run.note
+    assert "40" in run.note
+
+
+def test_probe_run_clean_result_is_trustable():
+    run = ProbeRun(results=[ProbeResult(key="a", name="a", category="c", url="u",
+                                        verdict="accessible")])
+    assert run.trustable is True
+    assert run.note == ""
+
+
+def test_probe_run_defaults_are_safe():
+    run = ProbeRun()
+    assert run.results == [] and run.aborted is False
+    assert isinstance(run.note, str)

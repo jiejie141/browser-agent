@@ -70,6 +70,13 @@ class Element(BaseModel):
     text: str = ""
     aria: str = ""
     placeholder: str = ""
+    # 元素所在的页面区域：main（主内容区）/ neutral（判断不出）/ chrome（导航·侧栏·页脚）。
+    #
+    # 为什么要多这个字段：编号预算只有 100 个，而按 DOM 顺序抓取时，
+    # **侧边栏和导航会把预算吃光**，正文里的链接一个都进不来 ——
+    # 表现是"页面上明明有搜索结果，Agent 却说不出来"。
+    # 有了区域之后，编号分配就能按区域配额度（见 perception.allocate）。
+    region: str = "neutral"
 
 
 class PageState(BaseModel):
@@ -93,7 +100,17 @@ class PageState(BaseModel):
         if self.elements:
             for el in self.elements:
                 label = el.text or el.aria or el.placeholder or "(无文字)"
-                lines.append(f"  [{el.ref}] <{el.tag}> {label}")
+                # 只给外围元素打标（导航/侧栏/页脚），主内容区不打 ——
+                # 一是省 token，二是模型最常犯的错就是把侧栏里的相关推荐
+                # 当成"第一条搜索结果"，这个标记正好压住它。
+                mark = " [导航/侧栏]" if el.region == "chrome" else ""
+                lines.append(f"  [{el.ref}] <{el.tag}> {label}{mark}")
+            if any(el.region == "chrome" for el in self.elements):
+                lines += [
+                    "",
+                    "注：标了 [导航/侧栏] 的是页面外围链接（菜单、分类、页脚），"
+                    "回答「第一条结果」这类问题时应优先用未标记的元素。",
+                ]
         else:
             lines.append("  (这一帧没有解析到可交互元素——可能是页面还在加载，")
             lines.append("   或者内容在 Canvas / iframe 里，可以试试 scroll 或 screenshot)")

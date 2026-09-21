@@ -4,6 +4,7 @@
     python eval/run_eval.py                          # 跑全部任务
     python eval/run_eval.py --only t01 t03           # 只跑指定任务
     python eval/run_eval.py --repeat 3               # 每个任务跑 3 次（看稳定性）
+    python eval/run_eval.py --task-file tasks/real_sites.json
 
 输出：
     - 终端一张汇总表
@@ -12,6 +13,20 @@
 为什么要版本化：改了提示词之后，你需要能回答
 "这次改动让哪几个任务从失败变成功、又让哪几个变差了"。
 没有明细文件，只记得住总数，定位不到具体是哪一条。
+
+## 环境预检（preflight）：为什么必须有
+
+`tasks/examples.json` 跑的是本地 file:// 页面，站点在不在跟网络无关。
+但 `tasks/real_sites.json` 跑的是真站点 —— **同一个 Agent、同一份代码，
+网络不同结果就不同**。如果不区分，就会把两种完全不同的失败混成一个数字：
+
+    ① Agent 不会做（该修的是提示词 / 元素分配）
+    ② 这台机器根本连不上那个站（该修的是网络，跟代码无关）
+
+混在一起最坏的结果是把 ② 当成 ①，然后为了让 ② 变绿去改提示词 ——
+在本地永远改不动，最后只能靠编数据。所以这里加了一道闸：
+**开跑之前先试连一次，连不上的任务标 `skipped`，不计入失败**，
+并在报告里单独列出。跑出来的成功率只对"能连上的那部分"负责。
 """
 
 from __future__ import annotations
@@ -19,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -33,8 +49,60 @@ from bagent.agent import ReActAgent, new_run_dir  # noqa: E402
 from bagent.browser import open_browser  # noqa: E402
 from bagent.config import get_settings  # noqa: E402
 from bagent.llm import build_client  # noqa: E402
+from bagent.siteprobe import looks_like_throttle  # noqa: E402
 
 console = Console()
+
+# 预检超时。比正式跑短：预检只回答"能不能连上"，不需要等页面渲染完。
+PREFLIGHT_TIMEOUT_MS = 20000
+
+
+async def preflight(urls: list[str], *, min_interval: float = 1.0) -> dict[str, tuple[bool, str]]:
+    """开一个无头浏览器，逐个体检这些 URL 能不能连上。
+
+    返回 `{url: (可达?, 原因)}`。
+
+    判定比 siteprobe 宽松：这里只问"网络通不通"，不问"页面内容够不够抓"
+    —— 登录墙、验证码、空壳页面都算**可达**，它们是 Agent 该处理的情形，
+    不属于环境问题。只有连接层失败（`looks_like_throttle` 认得的那一类）
+    才判为不可达。
+    """
+    out: dict[str, tuple[bool, str]] = {}
+    targets = [u for u in dict.fromkeys(urls) if u and not u.startswith("file://")]
+    if not targets:
+        return out
+
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            for i, url in enumerate(targets):
+                reason = ""
+                try:
+                    resp = await page.goto(
+                        url, timeout=PREFLIGHT_TIMEOUT_MS, wait_until="domcontentloaded"
+                    )
+                    status = resp.status if resp else None
+                    if status is None:
+                        out[url] = (False, "无响应")
+                        reason = "无响应"
+                    else:
+                        out[url] = (True, f"HTTP {status}")
+                except Exception as exc:  # noqa: BLE001
+                    msg = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+                    # 连接层失败 = 环境问题；其余（如页面自己跳来跳去）也先按不可达处理，
+                    # 但把原始错误带上，方便人判断到底是谁的问题。
+                    out[url] = (False, msg[:120])
+                    reason = msg[:60]
+                if reason:
+                    console.print(f"  [yellow]预检不可达[/yellow] {url[:56]} — {reason}")
+                if min_interval > 0 and i < len(targets) - 1:
+                    await asyncio.sleep(min_interval)
+        finally:
+            await browser.close()
+    return out
 
 # 反例任务里，出现这些词就认为 Agent 正确表达了"做不到"
 REFUSAL_MARKERS = (
@@ -46,32 +114,79 @@ REFUSAL_MARKERS = (
 def judge(task: dict, result) -> tuple[bool, str]:
     """判定一次运行是否算成功。
 
-    注意：counter 任务的判定是**启发式**的——靠回答里的措辞判断它有没有
-    正确放弃。这不是完美的判分方式，但比人工看强，且足够用于版本对比。
-    想更严谨需要引入人工标注，这一点我在简历里不会含糊其辞。
+    ## 两条被真实数据打出来才加的规矩
+
+    **一、反例任务必须"说出来"才算过。**
+
+    原先是 `if not result.finished: return True, "未完成（合理放弃）"`。
+    看起来很合理，实际上给"崩了"和"打转熔断了"发了免费通行证。跑真实站点时
+    抓到现行：京东那条（r12）里，Agent **确实认出了登录页**（thought 里写着
+    "当前页面是登录页面，需要先登录"），但它没有放弃 —— 它开始往登录框里
+    敲 `testuser` / `testpassword`，点登录、再点、再点，最后被"原地打转"熔断。
+    整个过程 `finished=False`、`answer=None`，按旧规矩算"合理放弃"，通过。
+
+    这是判分的错，不是模型的问题：反例任务要考的是**识别并声明做不到**，
+    "熔断"只是没做到 —— 它甚至更糟（试图用假账号登录）。所以改成
+    必须先说出理由（命中拒答措辞）才算过，`finished=False` 不再是免死金牌。
+
+    注意这不影响基线：t05/t06 两个反例本来就是靠"主动说明无法完成"过的，
+    收紧后依旧通过，`examples.json` 的 3/6 不变。
+
+    **二、normal 任务允许用正则约束"答案的形状"。**
+
+    `must_contain` 为空时，任何非空答案都算过 —— 这会让"答非所问"混过去。
+    真实站点上跑出来一个：r01 让它在百度搜「机械键盘」读第一条结果，
+    它交回了"一天11枚金牌！这是中国队的金牌速度"（百度首页的热搜新闻，
+    内容是真的、题答错了），因为没写 must_contain 于是判成通过。
+    有些任务的正确答案没法写死（GitHub 趋势第一名天天变），但**形状**是稳的
+    （`owner/repo`），于是加 `must_regex`：命中任一即算过，与 must_contain 同语义。
+    **三、有的任务机器判不了，就别硬判 —— 单列一档。**
+
+    r05 用 `must_regex` 钉 `owner/repo` 形状，看着挺聪明，实际跑完
+    我拿真值一对：当天 GitHub 趋势第一名是 `affaan-m/ECC`，
+    而它答的是 `anthropics/claude-code`（页面上确实有，但排第七）。
+    **形状对、内容错**，照样判成通过 —— 正则能证明"格式像"，证明不了"答对了"。
+
+    所以有了第三个 kind：`manual` ——
+    照跑、照记录答案，但**不自动判分**，在报告里单独列出来供人核对，
+    也不进成功率的分母。因为它没有可离线核对的真值来源
+    （微博热搜、掘金搜索结果的排序依赖登录态和个性化，抓一次一个样），
+    写死锚点会过期，写形状会放过错答，那就不装。
     """
     kind = task.get("kind", "normal")
+    answer = result.answer or ""
+
+    if kind == "manual":
+        # 不判对错，只把答案原样带出去给人看
+        return False, f"需人工核对（不计分）: {answer[:60] or '（空）'}"
 
     if kind == "counter":
-        if not result.finished:
-            # 没完成但也没崩，属于合理放弃
-            return True, "未完成（合理放弃）"
-        answer = result.answer or ""
         if any(m in answer for m in REFUSAL_MARKERS):
             return True, "主动说明无法完成"
+        if not result.finished:
+            why = result.error or "无错误信息，只是没跑完"
+            return False, f"未完成且没说明原因（{why[:40]}）—— 熔断不算拒答"
         return False, f"对做不到的任务给出了结论: {answer[:40]}"
 
     # normal 任务
     if not result.finished:
         return False, result.error or "未完成"
-    answer = result.answer or ""
     needed = task.get("must_contain") or []
-    if not needed:
+    patterns = task.get("must_regex") or []
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if not needed and not patterns:
         return (True, "已完成") if answer else (False, "完成但结论为空")
     hit = [k for k in needed if k.lower() in answer.lower()]
     if hit:
         return True, f"命中关键词 {hit}"
-    return False, f"结论未包含预期关键词 {needed}，实际: {answer[:60]}"
+    for p in patterns:
+        try:
+            if re.search(p, answer, re.IGNORECASE):
+                return True, f"命中形状 {p}"
+        except re.error as exc:  # 任务文件写错了正则，报出来而不是静默失败
+            return False, f"must_regex 不是合法正则: {p} ({exc})"
+    return False, f"结论未匹配预期（关键词 {needed} / 形状 {patterns}），实际: {answer[:60]}"
 
 
 async def run_task(task: dict, settings, max_steps: int | None) -> dict:
@@ -97,6 +212,8 @@ async def run_task(task: dict, settings, max_steps: int | None) -> dict:
     return {
         "id": task["id"],
         "kind": task.get("kind", "normal"),
+        # manual 任务照跑照记，但不进成功率的分子分母 —— 机器判不了就不硬判。
+        "scored": task.get("kind", "normal") != "manual",
         "ok": ok,
         "reason": reason,
         "answer": result.answer,
@@ -112,11 +229,60 @@ async def run_task(task: dict, settings, max_steps: int | None) -> dict:
     }
 
 
-def summarize(rows: list[dict]) -> dict:
-    total = len(rows)
-    passed = sum(1 for r in rows if r["ok"])
-    normal = [r for r in rows if r["kind"] == "normal"]
-    counter = [r for r in rows if r["kind"] == "counter"]
+def repeat_stats(rows: list[dict], repeat: int) -> list[dict]:
+    """把 `--repeat k` 的多次运行按任务汇总成 pass@k / pass^k。
+
+    ## 为什么单次跑出来的成功率不该直接引用
+
+    同一个任务集、同一份代码，跑两次就能得出不同的总数。实测：
+    收紧判分后跑基线，`t05/t06` 两个反例第一次是"主动说明无法完成"（过），
+    第二次变成"点同一个按钮 5 次熔断"（不过）；而 `t04` 反过来，
+    第一次熔断、第二次过了。单次结果 = **2/6 或 3/6 都能自圆其说** ——
+    这种数字拿去写简历，面试官让你现场复现就露馅了。
+
+    所以要报就报分布：
+
+    - `pass_at_k`：k 次里至少成功 1 次 —— "有能力做到"的证据；
+    - `pass_all_k`：k 次全成功 —— "稳定做到"的证据；
+    - 两者差距大，说明的是**稳定性问题**，不是能力问题。
+      小模型（本项目用的是 7B 级的 Qwen）在"该不该放弃"这种判断上本来就不稳。
+    """
+    if repeat <= 1:
+        return []
+    by_id: dict[str, list[dict]] = {}
+    for r in rows:
+        by_id.setdefault(r["id"], []).append(r)
+
+    out = []
+    for rid, group in by_id.items():
+        scored = [g for g in group if g.get("scored", True)]
+        if not scored:
+            out.append({"id": rid, "kind": group[0]["kind"], "scored": False, "runs": len(group)})
+            continue
+        passes = sum(1 for g in scored if g["ok"])
+        out.append(
+            {
+                "id": rid,
+                "kind": scored[0]["kind"],
+                "scored": True,
+                "runs": len(scored),
+                "passes": passes,
+                "pass_at_k": passes > 0,
+                "pass_all_k": passes == len(scored),
+            }
+        )
+    return out
+
+
+def summarize(rows: list[dict], skipped: list[dict] | None = None) -> dict:
+    skipped = skipped or []
+    # manual 任务（机器判不了的）不进分子也不进分母：混进去只会让数字变得没法解释。
+    scored_rows = [r for r in rows if r.get("scored", True)]
+    manual = [r for r in rows if not r.get("scored", True)]
+    total = len(scored_rows)
+    passed = sum(1 for r in scored_rows if r["ok"])
+    normal = [r for r in scored_rows if r["kind"] == "normal"]
+    counter = [r for r in scored_rows if r["kind"] == "counter"]
 
     def rate(items):
         if not items:
@@ -136,31 +302,105 @@ def summarize(rows: list[dict]) -> dict:
         "normal_rate": rate(normal),
         "counter_total": len(counter),
         "counter_rate": rate(counter),
-        "avg_steps": avg(rows, "steps"),
-        "avg_tokens": avg(rows, "total_tokens"),
-        "avg_cost_yuan": round(avg(rows, "cost_yuan"), 6),
-        "avg_elapsed": avg(rows, "elapsed"),
+        "manual_total": len(manual),
+        # skipped 是环境不可达、**没跑**的任务。单独记，
+        # 不混进分母：否则网络差一次成功率就掉一截，看着像代码退化了。
+        "skipped_total": len(skipped),
+        "declared_total": total + len(manual) + len(skipped),
+        "avg_steps": avg(scored_rows, "steps"),
+        "avg_tokens": avg(scored_rows, "total_tokens"),
+        "avg_cost_yuan": round(avg(scored_rows, "cost_yuan"), 6),
+        "avg_elapsed": avg(scored_rows, "elapsed"),
     }
 
 
-def print_report(rows: list[dict], stats: dict) -> None:
-    table = Table(show_header=True, header_style="bold", title="逐任务结果")
-    for col in ("ID", "类型", "结果", "步数", "token", "耗时(s)", "判定说明"):
+def print_report(
+    rows: list[dict],
+    stats: dict,
+    skipped: list[dict] | None = None,
+    repeat: int = 1,
+) -> None:
+    skipped = skipped or []
+    scored = [r for r in rows if r.get("scored", True)]
+    manual = [r for r in rows if not r.get("scored", True)]
+
+    if skipped:
+        sk = Table(show_header=True, header_style="bold yellow", title="环境预检未通过（未计分）")
+        for col in ("ID", "URL", "原因"):
+            sk.add_column(col)
+        for s in skipped:
+            sk.add_row(s["id"], s["url"][:52], s["reason"][:58])
+        console.print(sk)
+
+    table = Table(show_header=True, header_style="bold", title="逐次结果（自动判分）")
+    for col in ("ID", "类型", "第几次", "结果", "步数", "token", "耗时(s)", "判定说明"):
         table.add_column(col)
-    for r in rows:
+    seen: dict[str, int] = {}
+    for r in scored:
+        seen[r["id"]] = seen.get(r["id"], 0) + 1
         table.add_row(
             r["id"],
             r["kind"],
+            f"{seen[r['id']]}/{repeat}" if repeat > 1 else "-",
             "[green]通过[/green]" if r["ok"] else "[red]失败[/red]",
             str(r["steps"]),
             str(r["total_tokens"]),
             str(r["elapsed"]),
-            r["reason"][:48],
+            r["reason"][:44],
         )
     console.print(table)
 
+    if repeat > 1:
+        per_task = repeat_stats(rows, repeat)
+        rt = Table(show_header=True, header_style="bold cyan", title=f"稳定性（每个任务跑 {repeat} 次）")
+        for col in ("ID", "类型", f"过/共", "pass@{}".format(repeat), "pass^{}".format(repeat)):
+            rt.add_column(col)
+        for p in per_task:
+            if not p["scored"]:
+                rt.add_row(p["id"], p["kind"], "需人工核对", "—", "—")
+                continue
+            rt.add_row(
+                p["id"],
+                p["kind"],
+                f"{p['passes']}/{p['runs']}",
+                "是" if p["pass_at_k"] else "否",
+                "是" if p["pass_all_k"] else "否",
+            )
+        console.print(rt)
+
+    if manual:
+        mt = Table(show_header=True, header_style="bold magenta", title="只跑不判分（需人工核对）")
+        for col in ("ID", "步数", "Agent 的答案"):
+            mt.add_column(col)
+        for r in manual:
+            mt.add_row(r["id"], str(r["steps"]), (r["answer"] or "（空）")[:76])
+        console.print(mt)
+        console.print(
+            "[dim]这些任务的正确答案依赖登录态/个性化/当日内容，没有可离线核对的真值来源。"
+            "写死锚点会过期、写形状会放过错答，所以不自动判分、也不进分母。[/dim]"
+        )
+
     s = Table(show_header=False, box=None, title="汇总", padding=(0, 1))
-    s.add_row("端到端成功率", f"{stats['passed']}/{stats['total']} = {stats['success_rate']:.1%}")
+    parts = [f"{stats['passed']}/{stats['total']}"]
+    if stats["skipped_total"]:
+        parts.append(f"{stats['skipped_total']} 个环境预检未通过")
+    if stats["manual_total"]:
+        parts.append(f"{stats['manual_total']} 个需人工核对")
+    s.add_row("本次计分任务", "、".join(parts) + "（后两类均不计分）")
+    if repeat > 1:
+        s.add_row(
+            "按次成功率",
+            f"{stats['passed']}/{stats['total']} = {stats['success_rate']:.1%}"
+            f"（{repeat} 轮累计，**不能**读成单轮成功率）",
+        )
+        per_task = [p for p in repeat_stats(rows, repeat) if p["scored"]]
+        if per_task:
+            at_k = sum(1 for p in per_task if p["pass_at_k"]) / len(per_task)
+            all_k = sum(1 for p in per_task if p["pass_all_k"]) / len(per_task)
+            s.add_row("pass@%d（至少过一次）" % repeat, f"{at_k:.1%}")
+            s.add_row("pass^%d（次次都过）" % repeat, f"{all_k:.1%}")
+    else:
+        s.add_row("端到端成功率", f"{stats['passed']}/{stats['total']} = {stats['success_rate']:.1%}")
     s.add_row(
         "  其中 normal",
         f"{stats['normal_rate']:.1%}" if stats["normal_rate"] is not None else "—",
@@ -182,6 +422,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", nargs="*", help="只跑指定 id")
     parser.add_argument("--repeat", type=int, default=1, help="每个任务重复几次")
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument(
+        "--preflight",
+        dest="preflight",
+        action="store_true",
+        default=None,
+        help="跑之前先试连任务的 URL，连不上的标 skipped 不计分",
+    )
+    parser.add_argument(
+        "--no-preflight",
+        dest="preflight",
+        action="store_false",
+        help="跳过环境预检（本地 file:// 任务不需要）",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings(refresh=True)
@@ -194,6 +447,31 @@ def main(argv: list[str] | None = None) -> int:
     if not tasks:
         console.print("[red]没有匹配的任务[/red]")
         return 2
+
+    # 预检开关：命令行显式指定优先；否则由任务文件自己声明
+    # （真实站点的任务集里写着 `_network_dependent: true`）。
+    # 这样"要不要预检"跟着任务集走，而不是靠人记得加参数。
+    do_preflight = args.preflight
+    if do_preflight is None:
+        do_preflight = bool(data.get("_network_dependent"))
+
+    skipped: list[dict] = []
+    if do_preflight:
+        console.print("[bold cyan]环境预检：先确认这些站点在当前网络下连得上[/bold cyan]")
+        reach = asyncio.run(preflight([t["url"] for t in tasks]))
+        runnable = []
+        for t in tasks:
+            ok, reason = reach.get(t["url"], (True, ""))
+            if ok:
+                runnable.append(t)
+            else:
+                skipped.append({"id": t["id"], "url": t["url"], "reason": reason})
+        if skipped:
+            console.print(
+                f"[yellow]{len(skipped)}/{len(tasks)} 个任务因环境不可达被跳过，"
+                "不计入失败（但也不会让成功率显得更好看）[/yellow]"
+            )
+        tasks = runnable
 
     runs: list[dict] = []
     for rep in range(args.repeat):
@@ -208,17 +486,33 @@ def main(argv: list[str] | None = None) -> int:
                 break
 
     if not runs:
+        console.print("[red]没有任何任务实际跑起来[/red]")
+        if skipped:
+            print_report([], summarize([], skipped), skipped, repeat=args.repeat)
         return 1
 
-    stats = summarize(runs)
-    print_report(runs, stats)
+    stats = summarize(runs, skipped)
+    print_report(runs, stats, skipped, repeat=args.repeat)
 
     out = PROJECT_ROOT / "runs" / f"eval_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     out.write_text(
-        json.dumps({"stats": stats, "runs": runs}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "stats": stats,
+                "repeat": args.repeat,
+                "per_task": repeat_stats(runs, args.repeat),
+                "runs": runs,
+                "skipped": skipped,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     console.print(f"\n明细已写入 [bold]{out}[/bold]")
+    if stats["total"] == 0:
+        console.print("[yellow]没有任何可自动判分的任务（全是环境跳过或需人工核对），无法给出成功率[/yellow]")
+        return 1
     return 0 if stats["passed"] == stats["total"] else 1
 
 

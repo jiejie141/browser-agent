@@ -1,0 +1,112 @@
+{
+  "_network_dependent": true,
+  "_comment": "真实站点评测集。与 tasks/examples.json 分开，**不要合并**：examples.json 是简历里『6 任务集（4 常规 + 2 反例）/ 端到端 3-6』那条判分基线，混进来就没法对账了。这一份是第二层：真实站点、真实反爬、真实改版，用来回答『在玩具站上跑得通，那真网站呢』。用法：python eval/run_eval.py --task-file tasks/real_sites.json",
+  "_honesty": "真实站点的内容是会变的，所以 only 可长期验证的事实才写 must_contain（豆瓣第一名的片名、第 26 名的片名、茅台的股票代码）。其余留空：留空表示『Agent 正常完成并给出非空结论』即算过。**这比写死一个会过期的锚点诚实** —— 写死了只会在站点改版后把成功报成失败。但留空有个代价：『答非所问』也会算过（实测踩到，见 r01 的 _judge_note）。",
+  "_scoring": "⭐ 三类任务，只有第一类进成功率的分子分母：① kind=normal/counter 且写了判据 —— 自动判分，进分母；② kind=manual —— 照跑照记，答案列出来给人看，**不进分母**（微博热搜/掘金搜索/GitHub 趋势这类没有可离线核对的真值，写死会过期、写形状会放过错答，那就不装）；③ 环境预检没过的 —— **没跑**，不进分母。汇总里三类的数量都会显示，避免『分母被偷偷改小』。",
+  "_network_note": "⭐ 这份评测集的结果**强依赖网络环境**，所以文件头写了 `_network_dependent: true`：run_eval.py 会**自动**先做环境预检，连不上的任务标成 skipped、不计分，并在报告里单独列出来。这样『Agent 不会做』和『这台机器连不上』不会被混成同一个数字。本机实测：直连百度/GitHub/掘金可以读到真实正文；豆瓣等站在 chromium 里稳定 ERR_CONNECTION_CLOSED（curl 却能拿到 64KB，说明是出网链路对浏览器的拦截，不是站点挂了）。跑之前先确认网络，跑完之后看报告里的 skipped 表。",
+  "tasks": [
+    {
+      "id": "r01",
+      "kind": "normal",
+      "task": "在百度搜索框里搜索「机械键盘」，读出第一条自然搜索结果的标题。",
+      "url": "https://www.baidu.com/",
+      "_judge_note": "⭐ 这里**必须**写 must_contain=['键盘']。第一版留空，结果 Agent 交回了『一天11枚金牌！这是中国队的金牌速度』—— 百度首页的热搜新闻。内容是真的、位置也是首页，但题答错了：它没往搜索框里打字，只是读了页面上最显眼的元素。而『没写 must_contain ⇒ 任何非空答案都算过』让这个错答混成了通过。加一个『键盘』不追求严谨（首条结果标题里不一定有这两个字），只要求它能挡住『完全没搜』这种量级的错。",
+      "must_contain": ["键盘"],
+      "expected": "第一条搜索结果标题，且必须与机械键盘相关"
+    },
+    {
+      "id": "r02",
+      "kind": "normal",
+      "task": "打开豆瓣电影 Top250，读出排名第一的电影名称和它的评分。",
+      "url": "https://movie.douban.com/top250",
+      "must_contain": ["肖申克"],
+      "expected": "《肖申克的救赎》9.7（可长期验证的锚点）"
+    },
+    {
+      "id": "r03",
+      "kind": "normal",
+      "task": "打开豆瓣电影 Top250，翻到第 2 页，读出这一页排名第一的电影名称。",
+      "url": "https://movie.douban.com/top250",
+      "_judge_note": "第 2 页第一名 = 全榜第 26 名。锚点已核对：2026-09-21 取 https://movie.douban.com/top250?start=25 ，首条为《末代皇帝》9.3。Top250 是豆瓣最稳的一份榜单（改动极少），所以敢写 must_contain。",
+      "must_contain": ["末代皇帝"],
+      "expected": "《末代皇帝》（全榜第 26 名）—— 考翻页 + 元素编号分配"
+    },
+    {
+      "id": "r04",
+      "kind": "manual",
+      "task": "打开微博热搜榜，读出当前排名第一的热搜话题。",
+      "url": "https://s.weibo.com/top/summary",
+      "_judge_note": "热搜每几分钟就换一轮，而且榜单顺序依赖登录态与个性化 —— 写死锚点必然过期，写形状（一句话）等于没写。归到 manual：照跑照记，答案列出来给人看，但不自动判分。",
+      "expected": "热搜第 1 名话题（内容实时变化，无法自动判分）"
+    },
+    {
+      "id": "r05",
+      "kind": "manual",
+      "task": "打开 GitHub 趋势页，读出今日排名第一的仓库名称。",
+      "url": "https://github.com/trending",
+      "_judge_note": "⭐ 这条先说结论：**must_regex 钉形状是防不住的**。第一版用 `owner/repo` 正则，判成通过；我拿真值一对 —— 2026-09-21 当天趋势第一名是 `affaan-m/ECC`，Agent 答的是 `anthropics/claude-code`（页面上确实有，排第七）。形状对、内容错。Trending 榜按天变、还带个性化权重，没有可离线核对的稳定真值，所以改成 manual，不假装能自动判分。",
+      "must_contain": [],
+      "expected": "Trending 第 1 名仓库（形如 owner/repo；内容每日变化，需人工核对）"
+    },
+    {
+      "id": "r06",
+      "kind": "manual",
+      "task": "在掘金搜索 Python，读出第一条文章的标题。",
+      "url": "https://juejin.cn/",
+      "_judge_note": "掘金搜索结果由前端 JS 渲染，且排序依赖登录态与推荐权重 —— 从我这边抓到的 HTML 里根本没有结果条目（只有导航骨架），拿不到可核对的真值。归 manual。",
+      "must_contain": [],
+      "expected": "第一条文章标题（需人工核对）"
+    },
+    {
+      "id": "r07",
+      "kind": "normal",
+      "task": "在当当网搜索《三体》，读出第一本书的价格。",
+      "url": "https://search.dangdang.com/",
+      "must_contain": ["三体"],
+      "expected": "第一本《三体》的价格"
+    },
+    {
+      "id": "r08",
+      "kind": "manual",
+      "task": "在 B 站搜索 ReAct，读出第一条视频的标题。",
+      "url": "https://search.bilibili.com/",
+      "_judge_note": "视频搜索结果带个性化排序，且标题里没有稳定锚点可写。归 manual。",
+      "must_contain": [],
+      "expected": "第一条视频标题（需人工核对）"
+    },
+    {
+      "id": "r09",
+      "kind": "normal",
+      "task": "在东方财富网的搜索框里搜索「贵州茅台」，读出它的股票代码。",
+      "url": "https://so.eastmoney.com/",
+      "must_contain": ["600519"],
+      "expected": "600519（可长期验证的锚点）"
+    },
+    {
+      "id": "r10",
+      "kind": "manual",
+      "task": "打开 12306 的余票查询页，读出页面主标题文字。",
+      "url": "https://kyfw.12306.cn/otn/leftTicket/init",
+      "_judge_note": "这题本来是想考『页面上没有可用元素时能不能读到正文』，但标题文字我没法离线核对（12306 的页面标题跟版本走）。归 manual，不硬判。",
+      "must_contain": [],
+      "expected": "页面主标题（考无结果型页面的读取；需人工核对）"
+    },
+    {
+      "id": "r11",
+      "kind": "counter",
+      "task": "打开小红书首页，读出推荐流里的第一条笔记标题。",
+      "url": "https://www.xiaohongshu.com/",
+      "expect_no_completion": true,
+      "expected": "该站有登录墙/验证码，应识别出拿不到正文并主动放弃"
+    },
+    {
+      "id": "r12",
+      "kind": "counter",
+      "task": "在京东搜索「机械键盘」，读出第一个商品的名称和价格。",
+      "url": "https://search.jd.com/",
+      "expect_no_completion": true,
+      "_judge_note": "⭐ 这条是收紧判分标准的直接原因。跑出来的轨迹里 Agent **认出了**登录页，却没有放弃 —— 它往登录框里敲 testuser / testpassword，连点登录按钮无效后开始原地 scroll 打转，最后被熔断。旧判分把 finished=False 一律算『合理放弃』，于是这个行为被判成通过。现在必须先说出理由才算过。",
+      "expected": "京东搜索页会跳 passport 登录，应识别出拿不到结果并**明确说明**放弃"
+    }
+  ]
+}
