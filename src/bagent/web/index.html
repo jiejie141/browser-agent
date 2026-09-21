@@ -126,6 +126,25 @@ textarea{resize:vertical; min-height:76px; line-height:1.55}
 .quick button.risky{border-style:dashed; border-color:rgba(251,191,36,.42)}
 .quick button.risky:hover{border-color:var(--amber); color:var(--amber)}
 
+/* ---------- 选站搜索 ---------- */
+.lead{margin:0 0 14px; font-size:12.5px; color:var(--fg-2); line-height:1.7}
+.lead b{color:var(--cyan); font-weight:600}
+.sitebar{display:flex; gap:9px; flex-wrap:wrap}
+.sitebar select,.sitebar input{
+  background:var(--panel-2); border:1px solid var(--line-2); color:var(--fg);
+  border-radius:8px; padding:9px 11px; font-size:13px; font-family:var(--sans);
+}
+.sitebar select{flex:0 0 210px}
+.sitebar input{flex:1 1 260px; min-width:180px}
+.sitebar select:focus,.sitebar input:focus{outline:none; border-color:var(--cyan)}
+.sitebar .btn{flex:0 0 auto; padding:9px 18px}
+.sitehint,.hintline{margin-top:9px; font-size:11.5px; line-height:1.6; color:var(--fg-3)}
+.sitehint .muted,.muted{color:var(--fg-3)}
+.sitehint code{color:var(--fg-2); background:var(--panel-2); padding:1px 5px; border-radius:4px}
+.sitehint .warn{color:var(--amber)}
+.sitehint .good{color:var(--green)}
+.opt-login{color:var(--amber)}
+
 /* ---------- 结果面板 ---------- */
 .result{margin-top:16px; border-top:1px solid var(--line); padding-top:16px; display:none}
 .result.show{display:block}
@@ -217,52 +236,57 @@ code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); paddi
     <span class="pill" id="hp"><span class="dot" id="hd"></span><span id="ht">连接中…</span></span>
   </header>
 
-  <div class="card">
-    <h2>提交任务</h2>
-    <div class="grid">
-      <div>
-        <div class="f">
-          <label for="task">任务描述</label>
-          <textarea id="task" placeholder="例：打开名言网站首页，读出一句话的正文和作者"></textarea>
-          <div class="quick">
-            <button data-t="打开名言网站首页，读出一句话的正文和作者" data-u="https://quotes.toscrape.com/">读名言</button>
-            <button data-t="搜索《三体》并读出第一本书的价格" data-u="https://search.dangdang.com/">当当搜书</button>
-            <button data-t="打开首页，取回页面的主标题文字" data-u="https://example.com/">读标题</button>
-          </div>
-          <div class="quick-label">高频站点 — <b>免登录即可读</b>（真实站点，页面结构随时可能变）</div>
-          <div class="quick">
-            <button data-t="打开抖音首页，读出页面的主标题文字" data-u="https://www.douyin.com/">抖音首页</button>
-            <button data-t="打开淘宝首页，读出页面的主标题文字" data-u="https://www.taobao.com/">淘宝首页</button>
-            <button data-t="在百度搜索框里搜索 Python，读出第一条自然搜索结果的标题" data-u="https://www.baidu.com/">百度搜Python</button>
-            <button data-t="在 B 站搜索框里搜索 Python，读出第一条视频的标题" data-u="https://search.bilibili.com/">B站搜Python</button>
-            <button data-t="打开豆瓣电影 Top250，读出排名第一的电影名称和它的评分" data-u="https://movie.douban.com/top250">豆瓣Top250</button>
-            <button data-t="打开微博热搜榜，读出当前排名第一的热搜话题" data-u="https://s.weibo.com/top/summary">微博热搜</button>
-            <button data-t="打开 GitHub 趋势页，读出今日排名第一的仓库名称" data-u="https://github.com/trending">GitHub趋势</button>
-          </div>
-          <div class="quick-label">需要登录 / 有滑块验证 — <b>会被安全护栏拦下（这也是预期行为）</b></div>
-          <div class="quick">
-            <button class="risky" data-t="打开小红书首页，读出推荐流里的第一条笔记标题" data-u="https://www.xiaohongshu.com/">小红书</button>
-            <button class="risky" data-t="打开知乎首页，读出一条推荐的问答标题" data-u="https://www.zhihu.com/">知乎</button>
-            <button class="risky" data-t="搜索 Python 相关的职位，读出第一个职位名称" data-u="https://www.zhipin.com/">BOSS直聘</button>
-          </div>
-        </div>
-        <div class="f">
-          <label for="url">起始网址</label>
-          <input type="text" id="url" placeholder="https://" value="">
-        </div>
+    <div class="card">
+      <h2>去哪搜 · 搜什么</h2>
+      <p class="lead">
+        选一个站点、输入关键词，直接跳到它的搜索页并把结果读回来。
+        <b>关键词随你填</b> —— 这里没有写死的搜索内容。
+      </p>
+      <div class="sitebar">
+        <select id="site" title="选择站点"><option value="">加载站点中…</option></select>
+        <input type="text" id="kw" placeholder="想搜什么？例：机械键盘 / 三体 / ReAct 论文 / 显卡价格">
+        <button class="btn btn-primary" id="gosearch">去搜索</button>
       </div>
-      <div>
-        <div class="f">
-          <label for="engine">引擎</label>
-          <select id="engine"><option value="">默认</option></select>
+      <div class="sitehint" id="sitehint">
+        <span class="muted">支持 60+ 站点（综合搜索 / 电商 / 视频 / 社交 / 求职 / 财经 / 新闻 …）。</span>
+      </div>
+      <div class="quick-label">或者点一个现成例子</div>
+      <div class="quick">
+        <button data-t="打开名言网站首页，读出一句话的正文和作者" data-u="https://quotes.toscrape.com/">读名言</button>
+        <button data-t="打开抖音首页，读出页面的主标题文字" data-u="https://www.douyin.com/">抖音首页</button>
+        <button data-t="打开豆瓣电影 Top250，读出排名第一的电影名称和它的评分" data-u="https://movie.douban.com/top250">豆瓣Top250</button>
+        <button data-t="打开微博热搜榜，读出当前排名第一的热搜话题" data-u="https://s.weibo.com/top/summary">微博热搜</button>
+        <button data-t="打开 GitHub 趋势页，读出今日排名第一的仓库名称" data-u="https://github.com/trending">GitHub趋势</button>
+        <button data-t="打开首页，取回页面的主标题文字" data-u="https://example.com/">读标题</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>提交任务</h2>
+      <div class="grid">
+        <div>
+          <div class="f">
+            <label for="task">任务描述</label>
+            <textarea id="task" placeholder="例：在百度搜索「机械键盘」，读出第一条搜索结果的标题"></textarea>
+            <div class="hintline" id="taskhint"></div>
+          </div>
+          <div class="f">
+            <label for="url">起始网址</label>
+            <input type="text" id="url" placeholder="https://" value="">
+          </div>
         </div>
-        <div class="f">
-          <label for="ms">最大步数</label>
-          <input type="text" id="ms" placeholder="留空用默认（20）">
-        </div>
-        <div class="f">
-          <label class="chk"><input type="checkbox" id="mock"> 离线替身（不调真实模型、不花钱）</label>
-        </div>
+        <div>
+          <div class="f">
+            <label for="engine">引擎</label>
+            <select id="engine"><option value="">默认</option></select>
+          </div>
+          <div class="f">
+            <label for="ms">最大步数</label>
+            <input type="text" id="ms" placeholder="留空用默认（20）">
+          </div>
+          <div class="f">
+            <label class="chk"><input type="checkbox" id="mock"> 离线替身（不调真实模型、不花钱）</label>
+          </div>
         <button class="btn btn-primary" id="go" style="width:100%">▶ 开始执行</button>
       </div>
     </div>
@@ -459,12 +483,99 @@ function esc(s){
 /* 快捷示例 */
 document.querySelectorAll('.quick button').forEach(b => b.onclick = () => {
   $('#task').value = b.dataset.t; $('#url').value = b.dataset.u;
+  $('#taskhint').textContent = '';
 });
+
+/* ------------------------------------------------------------------
+   选站搜索：站点 + 关键词 → 搜索页网址
+   网址和任务描述都在服务端拼（POST /resolve），前端不存一份模板副本 ——
+   两处各存一份的话，站点改了 query 参数名时前端那份必然忘记同步，
+   表现为"选淘宝却跳去了京东"这类很难查的错位。
+------------------------------------------------------------------ */
+let SITE_MAP = {};
+
+function siteHintFor(s){
+  const p = s.probe;
+  if(p && p.ok === false){
+    const why = (p.block_hints && p.block_hints.length) ? ('命中提示：' + p.block_hints.join('、')) : p.verdict;
+    return `<span class="warn">⚠ ${esc(s.name)} 上次探测为「${esc(p.verdict)}」：${esc(why)}</span>`;
+  }
+  if(s.needs_login){
+    return `<span class="warn">⚠ ${esc(s.name)} 的搜索页通常要求登录 / 有验证，任务可能被安全护栏拦下。</span>`;
+  }
+  if(p && p.ok === true){
+    return `<span class="good">✓ 上次探测可正常读取</span>（元素 ${p.elements} / 正文 ${p.body_len} 字）`;
+  }
+  return `<span class="muted">该站点尚未探测；可跑 <code>python main.py --probe-sites</code> 实测。</span>`;
+}
+
+async function loadSites(){
+  const sel = $('#site'), hint = $('#sitehint');
+  try{
+    const d = await api('/sites');
+    const groups = {};
+    (d.sites || []).forEach(s => (groups[s.category] = groups[s.category] || []).push(s));
+    sel.innerHTML = Object.keys(groups).map(cat =>
+      `<optgroup label="${esc(cat)}">` + groups[cat].map(s =>
+        `<option value="${esc(s.key)}">${esc(s.name)}${s.needs_login ? '（需登录）' : ''}</option>`
+      ).join('') + `</optgroup>`
+    ).join('');
+    SITE_MAP = {};
+    (d.sites || []).forEach(s => SITE_MAP[s.key] = s);
+    const n = (d.sites || []).length;
+    const probe = d.probe;
+    const line = probe && probe.summary
+      ? `已探测 ${probe.summary.total} 个站点（${new Date(probe.probed_at).toLocaleString()}），可正常读取 ${probe.summary.accessible} 个。`
+      : (d.probe_hint || '');
+    hint.innerHTML = `<span class="muted">共 ${n} 个站点。${esc(line)}</span>`;
+    onSiteChange();
+  }catch(e){
+    sel.innerHTML = '<option value="">站点列表加载失败</option>';
+    hint.innerHTML = '<span class="warn">站点列表加载失败：' + esc(e.message) + '</span>';
+  }
+}
+
+function onSiteChange(){
+  const s = SITE_MAP[$('#site').value];
+  if(!s) return;
+  $('#sitehint').innerHTML = siteHintFor(s);
+}
+
+async function goSearch(){
+  const site = $('#site').value, kw = $('#kw').value.trim();
+  if(!site){ alert('请先选择站点'); return; }
+  if(!kw){ $('#kw').focus(); alert('请输入要搜索的关键词'); return; }
+  const btn = $('#gosearch');
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '解析中…';
+  try{
+    const r = await api('/resolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ site, keyword: kw })
+    });
+    $('#task').value = r.task;
+    $('#url').value = r.url;
+    $('#taskhint').innerHTML = r.needs_login
+      ? `<span class="warn">⚠ ${esc(r.warning)}</span>`
+      : `<span class="good">✓ 已解析</span> <code>${esc(r.url)}</code>`;
+    // 解析完直接跑：这一步的信息已经齐全（任务描述 + 起始网址），
+    // 再让用户点一次"开始执行"只是多一次点击，没有多出任何决策。
+    $('#go').click();
+  }catch(e){
+    $('#taskhint').innerHTML = '<span class="warn">解析失败：' + esc(e.message) + '</span>';
+  }finally{
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+$('#gosearch').onclick = goSearch;
+$('#site').onchange = onSiteChange;
+$('#kw').addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); goSearch(); } });
 
 $('#mock').addEventListener('change', () => {
   // 离线替身 + 真实模型的按钮文案要区别开，避免误以为在花钱
 });
 
+loadSites();
 boot().then(load);
 setInterval(load, 8000);
 </script>

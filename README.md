@@ -25,10 +25,38 @@
 # 4. 跑「高频站点演示集」（抖音 / 淘宝 / 百度 / B 站 / 豆瓣 / 微博 / GitHub …）
 #    真实站点，免登录即可读；--only N 只跑第 N 条
 .\.venv\Scripts\python.exe main.py --task-file tasks/demo_sites.json --only 1 --headful
+
+# 5. 实测站点表里每个搜索模板在**你当前网络下**能不能用（不需要 LLM key）
+#    结果写入 runs/site_probe.json，控制台会读它来显示每个站点的真实状态
+.\.venv\Scripts\python.exe main.py --probe-sites
+.\.venv\Scripts\python.exe main.py --probe-sites --probe-only taobao,baidu,jd
 ```
 
 VSCode 里直接按 **F5**，选「跑一个任务 (可改参数)」也一样，
 而且可以下断点单步调试。
+
+### 「想搜什么就搜什么」：站点注册表
+
+控制台顶部是**选站 + 输关键词**，不是写死的几个搜索按钮：
+
+```
+选站 [百度 ▾]   关键词 [机械键盘          ]   [去搜索]
+→ 任务：在百度搜索「机械键盘」，读出第一条搜索结果的标题。
+→ 网址：https://www.baidu.com/s?wd=%E6%9C%BA%E6%A2%B0%E9%94%AE%E7%9B%98
+```
+
+骨架（`https://www.baidu.com/s?wd={q}`）是稳定的，关键词是变量。
+把骨架沉淀进 `src/bagent/sites.py`，使用者就只需要选站 + 打字，
+不必记任何网址。共 **10 个分类 / 60+ 站点**（综合搜索、电商、视频、
+社交、知识技术、求职、生活服务、财经、新闻）。
+
+两处刻意的设计：
+
+- **拼网址在服务端做**（`POST /resolve`），前端不存模板副本。
+  两处各存一份的话，站点改了 query 参数名时前端那份必然忘记同步，
+  表现为"选淘宝却跳去了京东"这类很难查的错位。
+- **`needs_login` 如实回传**，控制台把这类站标成"需登录 / 有验证"。
+  藏掉它等于让用户点下去才发现被拦 —— 那是把项目的短板藏在用户脚下。
 
 ---
 
@@ -90,10 +118,15 @@ browser-agent/
 │   ├── perception.py        # 感知层：DOM 抽取 + 截图双通道
 │   ├── browser.py           # 动作层：Playwright 操作 + 敏感操作护栏
 │   ├── agent.py             # ReAct 主循环
+│   ├── graph_agent.py       # LangGraph 版引擎（与主循环共用感知/动作层）
+│   ├── sites.py             # 站点注册表：主流站点 + 搜索 URL 模板
+│   ├── siteprobe.py         # 实测站点模板可达性（可复跑，结果落快照）
 │   └── cli.py               # 命令行
 │
-├── tasks/examples.json      # 任务集（含反例任务）
+├── tasks/examples.json      # 评测任务集（含反例任务，简历里的判分基线）
+├── tasks/demo_sites.json    # 高频站点演示集（独立于判分基线）
 ├── runs/                    # 每次运行的产物：trace.json + 截图
+│   └── site_probe.json      # --probe-sites 的产物：站点可达性快照
 ├── tests/                   # 单元测试
 └── .vscode/                 # 一键运行 / 断点调试配置
 ```
@@ -154,6 +187,14 @@ LLM_MODEL=<模型名>
 | `STEP_TIMEOUT_SECONDS` | 30 | 单个浏览器动作的超时 |
 | `HEADLESS` | `true`（代码默认）/ `false`（`.env.example` 里显式写成 false） | true = 不显示浏览器窗口。脚本、服务、CI 都该无头；本地想看浏览器跑就填 false |
 | `TEARDOWN_TIMEOUT_SECONDS` | 8 | 浏览器收尾的总时间预算。超了放弃等待（任务状态不受影响），见「控制台暴露出来的四个真实缺陷」第 4 条 |
+| `BROWSER_PROXY` | 空 | 浏览器出口代理，如 `http://127.0.0.1:7890`。**留空 = 不传 proxy 参数**，跟随浏览器自身默认 |
+| `BROWSER_PROXY_BYPASS` | 空 | 不走代理的域名，逗号分隔，如 `baidu.com,taobao.com` |
+
+> 为什么代理要单独配一份，而不是跟随系统代理：系统代理是全局的，
+> 但浏览器该不该走代理取决于目标站点，一刀切两边都会坏。
+> 本机实测的真实约束 —— 国内站点经境外节点时淘宝只回 139 字空壳、
+> 百度直接 `ERR_CONNECTION_CLOSED`；而 GitHub / Google 不走代理又连不上。
+> 想让两边都能跑，就填 `BROWSER_PROXY` + 把国内域名列进 `BROWSER_PROXY_BYPASS`。
 
 ---
 

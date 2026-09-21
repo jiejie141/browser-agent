@@ -47,6 +47,7 @@ from .browser import open_browser
 from .config import get_settings
 from .graph_agent import build_agent
 from .llm import LLMError, MockLLMClient, build_client
+from .sites import CATEGORIES, find, render_task, search_url, stats
 
 log = logging.getLogger(__name__)
 
@@ -161,6 +162,51 @@ def engines() -> dict[str, Any]:
         "default": getattr(get_settings(), "engine", "handwritten"),
         "available": ["handwritten", "langgraph"],
         "note": "handwritten 零额外依赖；langgraph 需要 pip install langgraph",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 站点注册表
+#
+# 「站点 + 关键词 → 搜索页网址」这一步放在服务端算，不让前端各存一份模板：
+# 模板一改（站点换 query 参数名），前端那份必然忘记同步，
+# 表现是"界面上搜淘宝跳去了京东"这类难查的错位。单一来源在这里。
+# ---------------------------------------------------------------------------
+class ResolveRequest(BaseModel):
+    site: str = Field(..., min_length=1, max_length=64, description="站点 key 或名称")
+    keyword: str = Field(..., min_length=1, max_length=200, description="搜索关键词")
+
+
+@app.get("/sites", summary="站点列表（含搜索 URL 模板与实测状态）")
+def list_sites() -> dict[str, Any]:
+    # 状态来自 runs/site_probe.json 这份可复跑的探测快照，而不是代码里写死的结论。
+    # 快照不存在时只回模板 + 一句怎么测的提示，不编造"都可用"。
+    from .siteprobe import default_snapshot_path, load, merge
+
+    snapshot = load(default_snapshot_path())
+    payload = merge(snapshot)
+    payload["stats"] = stats()
+    payload["categories"] = CATEGORIES
+    return payload
+
+
+@app.post("/resolve", summary="站点 + 关键词 → 搜索页网址 + 任务描述")
+def resolve(req: ResolveRequest) -> dict[str, Any]:
+    s = find(req.site)
+    if s is None:
+        raise HTTPException(404, f"未知站点: {req.site}")
+    return {
+        "site": s.to_dict(),
+        "url": search_url(s.key, req.keyword),
+        "task": render_task(s.key, req.keyword),
+        # needs_login 要如实回传：前端据此把按钮标成"可能进不去"。
+        # 隐瞒它等于让用户点下去才发现被拦，那是把项目的短板藏在用户脚下。
+        "needs_login": s.needs_login,
+        "warning": (
+            f"{s.name} 的搜索页需要登录或有验证，任务可能被安全护栏拦下。"
+            if s.needs_login
+            else ""
+        ),
     }
 
 

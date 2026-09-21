@@ -16,6 +16,24 @@
       "justMyCode": false
     },
     {
+      // 实测站点表里每个搜索模板在**你当前网络下**能不能用。
+      // 不调模型、不需要 key，纯浏览器探测；结果写入 runs/site_probe.json，
+      // 控制台会读这份快照来显示每个站点的真实状态（而不是写死一个结论）。
+      // 想缩小范围就把 --probe-only 打开，例：["--probe-sites","--probe-only","taobao,baidu"]
+      "name": "①b 实测站点表可达性 (--probe-sites)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--probe-sites"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "justMyCode": false
+    },
+    {
       "name": "② 离线跑主循环 (不需要 key)",
       "type": "debugpy",
       "request": "launch",

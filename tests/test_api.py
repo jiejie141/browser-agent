@@ -470,3 +470,66 @@ def test_task_reaches_terminal_state_even_if_teardown_hangs(client, monkeypatch,
     s = client.get(f"/tasks/{tid}").json()
     assert s["status"] == "succeeded", f"终态被收尾绑架了，仍是 {s['status']}"
     assert s["finished_at"], "finished_at 也必须落表"
+
+
+# ---------------------------------------------------------------------------
+# 站点注册表端点
+#
+# 这两条守的是一件事：**"站点 + 关键词 → 搜索页网址"必须由服务端给出**。
+# 如果哪天有人图省事把模板抄一份到前端，这两条接口的契约就是唯一的
+# 单一来源证明 —— 前端拿不到正确网址时，问题会被定位到接口而不是前端。
+# ---------------------------------------------------------------------------
+def test_sites_endpoint_lists_templates(client):
+    r = client.get("/sites")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["stats"]["total"] > 40
+    assert body["categories"], "分类不能为空"
+    by = {s["key"]: s for s in body["sites"]}
+    assert "{q}" in by["baidu"]["search"]
+    # 没探测快照时不能编造状态，但必须告诉使用者怎么测
+    if body.get("probe") is None:
+        assert "probe_hint" in body
+        assert all("probe" not in s for s in body["sites"])
+
+
+def test_resolve_builds_url_and_task(client):
+    r = client.post("/resolve", json={"site": "baidu", "keyword": "机械键盘"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["url"].startswith("https://www.baidu.com/s?wd=")
+    assert "%E6%9C%BA%E6%A2%B0%E9%94%AE%E7%9B%98" in body["url"], "中文必须编码"
+    assert "机械键盘" in body["task"]
+    assert body["needs_login"] is False
+    assert body["warning"] == ""
+
+
+def test_resolve_accepts_loose_site_name(client):
+    """使用者写「B站」也要能解析，且要落在主站而不是视频子站。"""
+    r = client.post("/resolve", json={"site": "B站", "keyword": "ReAct"})
+    assert r.status_code == 200
+    assert r.json()["site"]["key"] == "bilibili"
+
+
+def test_resolve_warns_for_login_walled_site(client):
+    r = client.post("/resolve", json={"site": "xiaohongshu", "keyword": "三体"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["needs_login"] is True
+    assert body["warning"], "需要登录的站点必须给出警告，不能静默"
+
+
+def test_resolve_unknown_site_returns_404(client):
+    r = client.post("/resolve", json={"site": "不存在站", "keyword": "x"})
+    assert r.status_code == 404
+
+
+def test_resolve_rejects_empty_keyword(client):
+    r = client.post("/resolve", json={"site": "baidu", "keyword": ""})
+    assert r.status_code == 422
+
+
+def test_resolve_documented_in_openapi(client):
+    spec = client.get("/openapi.json").json()
+    assert "/sites" in spec["paths"]
+    assert "/resolve" in spec["paths"]

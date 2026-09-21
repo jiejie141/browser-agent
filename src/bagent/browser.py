@@ -55,10 +55,22 @@ class BrowserSession:
 
     async def __aenter__(self) -> "BrowserSession":
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=self.settings.headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        launch_kwargs: dict = {
+            "headless": self.settings.headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        # 代理是可选的：留空就完全不加这个键，让浏览器用它的默认出口。
+        # 之所以不写 `proxy={"server": ""}`，是因为空字符串会被 Playwright
+        # 当成一个非法代理地址直接抛错 —— "不配置"必须是"不传参"。
+        proxy_server = (getattr(self.settings, "browser_proxy", "") or "").strip()
+        if proxy_server:
+            proxy_cfg: dict = {"server": proxy_server}
+            bypass = (getattr(self.settings, "browser_proxy_bypass", "") or "").strip()
+            if bypass:
+                proxy_cfg["bypass"] = bypass
+            launch_kwargs["proxy"] = proxy_cfg
+            log.info("浏览器出口走代理 %s（bypass=%s）", proxy_server, bypass or "-")
+        self._browser = await self._pw.chromium.launch(**launch_kwargs)
         self._context = await self._browser.new_context(
             viewport={"width": 1440, "height": 900},
             locale="zh-CN",

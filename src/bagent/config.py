@@ -96,6 +96,20 @@ class Settings:
     # 两者共用同一套 perceive / 动作层 / 提示词，可用同一份评测集做 A/B 对比
     engine: str = field(default_factory=lambda: _get("ENGINE", "handwritten").lower())
 
+    # ---- 浏览器出口（代理）----
+    # 为什么浏览器要单独配一份：系统代理是"全局"的，但浏览器该不该走代理
+    # 取决于目标站点，不能一刀切。真实约束：国内站点经境外节点会被拒
+    # （实测淘宝只回空壳页、百度直接断连），而 GitHub / Google 不走代理又连不上。
+    # 所以这里给 browser_proxy + browser_proxy_bypass 两个旋钮：
+    # 默认都留空 = 跟随浏览器自身的默认（通常是系统代理），行为与改版前一致。
+    # 例：
+    #   BROWSER_PROXY=http://127.0.0.1:7890
+    #   BROWSER_PROXY_BYPASS=taobao.com,baidu.com,weibo.com
+    browser_proxy: str = field(default_factory=lambda: _get("BROWSER_PROXY"))
+    browser_proxy_bypass: str = field(
+        default_factory=lambda: _get("BROWSER_PROXY_BYPASS")
+    )
+
     # ---- 离线替身 ----
     # True 表示本次运行不调用真实模型：Agent 据此把成本计为 0
     # （离线替身的 token 是按字符估的，乘单价会算出一个并不存在的花费）。

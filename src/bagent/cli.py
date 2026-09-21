@@ -252,6 +252,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Agent 引擎：handwritten（默认，零额外依赖的手写 ReAct 循环）"
         " / langgraph（LangGraph StateGraph 实现）",
     )
+    parser.add_argument(
+        "--probe-sites",
+        action="store_true",
+        help="实测 sites.py 里所有站点的搜索模板可达性，结果写入 runs/site_probe.json"
+        "（不需要 LLM key，纯浏览器探测）",
+    )
+    parser.add_argument(
+        "--probe-keyword",
+        default="Python",
+        help="探测时用的关键词（默认 Python）",
+    )
+    parser.add_argument(
+        "--probe-only",
+        help="只探指定站点，逗号分隔 key 或名称，例：--probe-only taobao,baidu",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings(refresh=True)
@@ -266,6 +281,21 @@ def main(argv: list[str] | None = None) -> int:
         # 报出一个并不存在的花费（实测 ¥0.00347）—— 使用者会以为真花了钱。
         settings.mock = True
     setup_logging(settings.log_level)
+
+    # 站点探测放在 doctor 之后、validate 之前：它只用浏览器、不调模型，
+    # 拿"没配 key"去拦它是错的（真拦住的话，用户在最需要排查网络的场景下
+    # 反而跑不了这个命令）。
+    if args.probe_sites:
+        from .siteprobe import run_cli_probe
+
+        only = (
+            [x.strip() for x in args.probe_only.split(",") if x.strip()]
+            if args.probe_only
+            else None
+        )
+        return asyncio.run(
+            run_cli_probe(keyword=args.probe_keyword, only=only)
+        )
 
     if args.doctor:
         return doctor(settings, mock=args.mock)
