@@ -21,6 +21,10 @@
 
 # 3. 跑整个示例任务集
 .\.venv\Scripts\python.exe main.py --task-file tasks/examples.json --headful
+
+# 4. 跑「高频站点演示集」（抖音 / 淘宝 / 百度 / B 站 / 豆瓣 / 微博 / GitHub …）
+#    真实站点，免登录即可读；--only N 只跑第 N 条
+.\.venv\Scripts\python.exe main.py --task-file tasks/demo_sites.json --only 1 --headful
 ```
 
 VSCode 里直接按 **F5**，选「跑一个任务 (可改参数)」也一样，

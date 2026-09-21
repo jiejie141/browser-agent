@@ -1,0 +1,87 @@
+{
+  "_comment": "演示任务集（demo，不是评测基线）。用真实高流量站点跑通『打开→定位→读取』全链路。examples.json 才是简历里『6 任务集 / 端到端 3-6』的评分基线，不要拿这份去改判分。用法：python -m bagent.cli run --task-file tasks/demo_sites.json  或  --task-file tasks/demo_sites.json --only 3",
+  "_note": "这些站点的页面结构会变，must_contain 留空表示『只要 Agent 正常完成并给出文本就算过』；有具体锚点的（豆瓣/当当）才写死。带 login_wall 标记的站点有登录墙或滑块验证，任务是反例：考察 Agent 能否识别做不到并主动放弃。",
+  "tasks": [
+    {
+      "id": "d01",
+      "kind": "normal",
+      "task": "打开抖音首页，读出页面的主标题文字。",
+      "url": "https://www.douyin.com/",
+      "must_contain": [],
+      "expected": "页面主标题（通常含『抖音』）"
+    },
+    {
+      "id": "d02",
+      "kind": "normal",
+      "task": "打开淘宝首页，读出页面的主标题文字。",
+      "url": "https://www.taobao.com/",
+      "must_contain": [],
+      "expected": "页面主标题"
+    },
+    {
+      "id": "d03",
+      "kind": "normal",
+      "task": "在百度搜索框里搜索 Python，读出第一条自然搜索结果的标题。",
+      "url": "https://www.baidu.com/",
+      "must_contain": [],
+      "expected": "第一条搜索结果标题（含 Python 相关关键词）"
+    },
+    {
+      "id": "d04",
+      "kind": "normal",
+      "task": "在 B 站搜索框里搜索 Python，读出第一条视频的标题。",
+      "url": "https://search.bilibili.com/",
+      "must_contain": [],
+      "expected": "第一条视频标题"
+    },
+    {
+      "id": "d05",
+      "kind": "normal",
+      "task": "打开豆瓣电影 Top250，读出排名第一的电影名称和它的评分。",
+      "url": "https://movie.douban.com/top250",
+      "must_contain": ["肖申克"],
+      "expected": "《肖申克的救赎》+ 9.7"
+    },
+    {
+      "id": "d06",
+      "kind": "normal",
+      "task": "打开微博热搜榜，读出当前排名第一的热搜话题。",
+      "url": "https://s.weibo.com/top/summary",
+      "must_contain": [],
+      "expected": "热搜第 1 名的话题文字（内容每日变化）"
+    },
+    {
+      "id": "d07",
+      "kind": "normal",
+      "task": "打开 GitHub 趋势页，读出今日排名第一的仓库名称。",
+      "url": "https://github.com/trending",
+      "must_contain": [],
+      "expected": "Trending 第 1 名的仓库名（内容每日变化）"
+    },
+    {
+      "id": "d08",
+      "kind": "normal",
+      "task": "在掘金搜索 Python，读出第一条文章的标题。",
+      "url": "https://juejin.cn/",
+      "must_contain": [],
+      "expected": "第一条文章标题"
+    },
+    {
+      "id": "d09",
+      "kind": "normal",
+      "task": "在当当网搜索《三体》，读出第一本书的价格。",
+      "url": "https://search.dangdang.com/",
+      "must_contain": ["三体"],
+      "expected": "第一本《三体》的价格"
+    },
+    {
+      "id": "d10",
+      "kind": "counter",
+      "login_wall": true,
+      "task": "打开小红书首页，读出推荐流里的第一条笔记标题。",
+      "url": "https://www.xiaohongshu.com/",
+      "expect_no_completion": true,
+      "expected": "该站有登录墙/验证码，Agent 应识别出拿不到正文，主动放弃并说明原因"
+    }
+  ]
+}
