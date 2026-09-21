@@ -27,6 +27,7 @@ from typing import Awaitable, Callable
 
 from .browser import BrowserSession
 from .config import Settings
+from .grounding import MAX_GROUNDING_RETRIES, check_grounding
 from .llm import LLMClient, LLMError, build_client
 from .models import Action, StepRecord, Usage, parse_action
 from .perception import perceive
@@ -46,7 +47,7 @@ SYSTEM_PROMPT = """你是一个浏览器自动化 Agent。你的目标是通过�
 - scroll     滚动页面            参数: dy（正数向下滚，负数向上滚）
 - extract    读取当前页面正文    无参数
 - screenshot 截图交给视觉通道    无参数
-- finish     任务已完成          参数: answer（最终结论）
+- finish     任务已完成          参数: answer（最终结论）, evidence（见下）
 
 输出格式（**必须是合法 JSON，不要包在代码块里，不要加任何前后解释**）：
 {"thought": "这一步为什么这么做", "action": "click", "ref": 3}
@@ -70,6 +71,19 @@ SYSTEM_PROMPT = """你是一个浏览器自动化 Agent。你的目标是通过�
 - 不要点「← Previous」「Next →」这类翻页链接，除非任务明确要求翻页。
 - 如果某个动作已经连续做过两次却没有带来任何新信息，立刻停止它，
   改用 finish 给出你目前能给出的结论。
+
+关于 evidence（**引擎会核对，对不上会被退回重做**）：
+- finish 必须带 evidence：从**当前页面正文摘要**里**原样复制**一段能支撑结论的原文
+  （不要把词序、标点、大小写"整理"一遍）。
+- answer 里提到的每个人名、数字、标题，都**必须真的出现在这段原文里**。
+  这是为了防止"引用了 A 却答了 B"。
+- ⚠️ **不要凭记忆写 evidence。** 记忆里的和页面上的往往不一样 ——
+  如果你的结论来自记忆而不是刚读到的原文，请回去重新读一遍页面再 finish。
+- 如果引用的是页码/序号（"第一条""排名第 3"），请连同**它相邻的原文**一起复制，
+  只写"第一条"这三个字不构成证据。
+- 只有一种情况可以不带 evidence：结论是"我做不到"（例如页面要求登录、
+  页面上没有下单按钮）。这类结论断言的是"页面上没有某个东西"，
+  引擎不会要求你引用一个不存在的东西。
 """
 
 
@@ -113,6 +127,12 @@ class RunResult:
     records: list[StepRecord] = field(default_factory=list)
     run_dir: str = ""
     error: str = ""
+    # 证据锚定结果。`grounded=True` 表示"结论通过了证据核对"（不是"答对了"，
+    # 两者必须分开看：判分归评测，这里只回答"结论有没有页面依据"）。
+    # `grounding_retries` 记被退回重做几次 —— 它本身就是一个可观测的自纠指标。
+    grounded: bool = False
+    grounding_note: str = ""
+    grounding_retries: int = 0
 
 
 # action 可以是 None：模型输出不是合法 JSON 的那一步没有可执行的 Action，
@@ -152,6 +172,10 @@ class ReActAgent:
         consecutive_failures = 0
         answer, finished, error = "", False, ""
         prefer_vision = False
+        # finish 被证据核对退回的次数。超过上限就采纳答案并把 grounded 标 False ——
+        # 目的是"逼模型自纠"，不是"把它卡死"（卡死只会让评测从答错变成没答案）。
+        grounding_retries = 0
+        grounded, grounding_note = False, ""
         # 动作指纹轨迹：用来抓"原地打转"。
         # 只靠 consecutive_failures 抓不到循环——循环里每一步都是"成功"的，
         # 只是毫无进展。这是 7B 级别模型最典型的失效方式。
@@ -218,16 +242,51 @@ class ReActAgent:
 
             # ---------- 做（Act）----------
             if action.action == "finish":
+                verdict = check_grounding(
+                    action.answer or "", action.evidence or "", state.body_text, task
+                )
+                # 证据对不上 → 退回重做。这是本引擎里唯一"会拒绝 finish"的地方，
+                # 所以退回原因必须写得足够具体，否则小模型只会原地再交一次同样的答案。
+                if not verdict.ok and grounding_retries < MAX_GROUNDING_RETRIES:
+                    grounding_retries += 1
+                    message = f"finish 被退回（{grounding_retries}/{MAX_GROUNDING_RETRIES}）：{verdict.reason}"
+                    records.append(
+                        StepRecord(
+                            step=step, action=action, ok=False, message=message,
+                            url_after=state.url, screenshot_path=state.screenshot_path,
+                        )
+                    )
+                    if self.on_step:
+                        self.on_step(step, action, False, message)
+                    history.append(
+                        f"第 {step} 步: {message}。"
+                        "请重新读一遍「页面正文摘要」，把支撑结论的原文**原样复制**到 evidence，"
+                        "并确认 answer 里的每个人名 / 数字 / 标题都出现在这段原文里，再调用 finish。"
+                    )
+                    history = history[-12:]
+                    continue
+
                 finished = True
                 answer = (action.answer or "").strip()
+                grounded = verdict.grounded
+                note = verdict.reason
+                if not verdict.ok:
+                    note = (
+                        f"已重试 {grounding_retries} 次仍未通过证据核对，按当前答案收尾："
+                        f"{verdict.reason}"
+                    )
+                elif not verdict.checked:
+                    note = f"未做证据核对（{verdict.reason}）"
+                grounding_note = note
                 records.append(
                     StepRecord(
                         step=step, action=action, ok=True,
-                        message="任务结束", url_after=state.url,
+                        message="任务结束" + ("（证据已核对）" if grounded else f"（{note}）"),
+                        url_after=state.url,
                     )
                 )
                 if self.on_step:
-                    self.on_step(step, action, True, "任务结束")
+                    self.on_step(step, action, True, "任务结束（证据已核对）" if grounded else "任务结束")
                 break
 
             if action.action == "extract":
@@ -306,6 +365,9 @@ class ReActAgent:
             records=records,
             run_dir=str(run_dir),
             error=error,
+            grounded=grounded,
+            grounding_note=grounding_note,
+            grounding_retries=grounding_retries,
         )
         self._dump(result, run_dir / "trace.json")
         return result

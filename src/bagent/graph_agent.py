@@ -57,6 +57,7 @@ from .agent import (
 )
 from .browser import BrowserSession
 from .config import Settings
+from .grounding import MAX_GROUNDING_RETRIES, check_grounding
 from .llm import LLMClient, LLMError, build_client
 from .models import Action, StepRecord, Usage, parse_action
 from .perception import perceive
@@ -137,6 +138,11 @@ class AgentState(TypedDict, total=False):
     answer: str
     error: str
     records: list[dict]
+    # 证据锚定（与手写引擎同一套口径，见 grounding.py）。这三个字段必须在图里
+    # 显式声明，否则 finish 被退回后 retries 会每步归零 → 退回次数无限，卡死。
+    grounded: bool
+    grounding_note: str
+    grounding_retries: int
 
 
 def _note(state: AgentState, text: str) -> list[str]:
@@ -291,20 +297,69 @@ class LangGraphReActAgent:
 
         st = state.get("page_state")
 
-        # --- finish：任务结束 ---
+        # --- finish：任务结束（先过证据核对，见 grounding.py）---
         if action.action == "finish":
+            verdict = check_grounding(
+                action.answer or "", action.evidence or "", st.body_text,
+                state.get("task", ""),
+            )
+            retries = state.get("grounding_retries", 0)
+            if not verdict.ok and retries < MAX_GROUNDING_RETRIES:
+                # 对不上就退回重做，而不是直接采纳 —— 与手写引擎完全一致。
+                # 这里**故意不写 finished**，让 route_after_act 走回 perceive。
+                retries += 1
+                message = (
+                    f"finish 被退回（{retries}/{MAX_GROUNDING_RETRIES}）：{verdict.reason}"
+                )
+                records.append(
+                    StepRecord(
+                        step=step, action=action, ok=False, message=message,
+                        url_after=st.url,
+                    ).model_dump()
+                )
+                if self.on_step:
+                    self.on_step(step, action, False, message)
+                return {
+                    "records": records,
+                    "grounding_retries": retries,
+                    "history": _note(
+                        state,
+                        f"第 {step} 步: {message}。"
+                        "请重新读一遍「页面正文摘要」，把支撑结论的原文**原样复制**到 "
+                        "evidence，并确认 answer 里的每个人名 / 数字 / 标题都出现在这段"
+                        "原文里，再调用 finish。",
+                    ),
+                    # 清掉已消费的动作，避免退回后 LangGraph 沿用旧 action。
+                    "action": None,
+                }
+
+            grounded = verdict.grounded
+            note = verdict.reason
+            if not verdict.ok:
+                note = (
+                    f"已重试 {retries} 次仍未通过证据核对，按当前答案收尾：{verdict.reason}"
+                )
+            elif not verdict.checked:
+                note = f"未做证据核对（{verdict.reason}）"
             records.append(
                 StepRecord(
-                    step=step, action=action, ok=True, message="任务结束",
+                    step=step, action=action, ok=True,
+                    message="任务结束" + ("（证据已核对）" if grounded else f"（{note}）"),
                     url_after=st.url,
                 ).model_dump()
             )
             if self.on_step:
-                self.on_step(step, action, True, "任务结束")
+                self.on_step(
+                    step, action, True,
+                    "任务结束（证据已核对）" if grounded else "任务结束",
+                )
             return {
                 "finished": True,
                 "answer": (action.answer or "").strip(),
                 "records": records,
+                "grounded": grounded,
+                "grounding_note": note,
+                "grounding_retries": retries,
             }
 
         # --- extract：读正文，不碰浏览器 ---
@@ -401,6 +456,9 @@ class LangGraphReActAgent:
                 "answer": "",
                 "error": "",
                 "records": [],
+                "grounded": False,
+                "grounding_note": "",
+                "grounding_retries": 0,
             }
         )
 
@@ -432,6 +490,9 @@ class LangGraphReActAgent:
             records=records,
             run_dir=str(run_dir),
             error=error,
+            grounded=bool(final.get("grounded")),
+            grounding_note=final.get("grounding_note", ""),
+            grounding_retries=int(final.get("grounding_retries", 0) or 0),
         )
         self._dump(result, run_dir / "trace.json")
         return result

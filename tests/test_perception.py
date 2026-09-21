@@ -178,6 +178,70 @@ def test_prompt_omits_notice_when_no_chrome():
 
 
 # ---------------------------------------------------------------------------
+# 正文截断必须保序 —— t02 答错作者的直接原因
+#
+# 旧写法把正文拼成 head + "（中间省略）" + tail。这种拼接会**制造出页面上
+# 并不存在的相邻关系**：实测 quotes.toscrape.com/page/2/（3449 字）里，
+# 第一句的正文在 head（offset 26），它自己的作者("by Marilyn Monroe",
+# offset 1110)落进了被省略的中间，而 tail 里躺着一个别人的作者
+# ("by Elie Wiesel", offset 2708)。模型看见"A 的正文 + 陌生作者"，就把它们
+# 配成了一对 —— 三轮全败，稳定复现。
+#
+# 所以这些用例钉的不是"截断得好不好看"，而是**观察有没有在骗模型**。
+# ---------------------------------------------------------------------------
+def _page2_like_body() -> str:
+    """复刻 page/2 的关键结构：首句 → (省略区) 首句作者 → (尾部) 别人的作者。"""
+    filler = "x" * 80
+    return (
+        '"This life is what you make it. No matter what."\n'
+        + (filler + "\n") * 12
+        + "by Marilyn Monroe (about)\n"      # 首句的作者
+        + (filler + "\n") * 28
+        + "by Elie Wiesel (about)\n"          # 别人的作者（旧写法会把它拼上来）
+    )
+
+
+class TestBodyElisionKeepsOrder:
+    def test_short_body_is_untouched(self):
+        st = PageState(body_text="甲乙丙")
+        assert "甲乙丙" in st.render_for_prompt()
+
+    def test_never_splices_head_and_tail(self):
+        """绝不能出现"头部 + 省略 + 尾部"这种拼接 —— 它在暗示两者相邻。"""
+        st = PageState(body_text=_page2_like_body())
+        txt = st.render_for_prompt()
+        assert "中间省略" not in txt
+        assert "不相邻" in txt, "截断时要如实说明省略部分与上面的内容不相邻"
+
+    def test_first_item_keeps_its_own_author(self):
+        """t02 的正面用例：第一句的正文和它的作者必须同时可见且相邻。"""
+        st = PageState(body_text=_page2_like_body())
+        txt = st.render_for_prompt()
+        assert "This life is what you make it" in txt
+        assert "by Marilyn Monroe" in txt, "首句的作者不能被截断吃掉"
+
+    def test_tail_is_not_smuggled_in_as_the_first_items_author(self):
+        """旧写法的致命处：尾部那个"别人的作者"会被模型当成首句的作者。"""
+        st = PageState(body_text=_page2_like_body())
+        txt = st.render_for_prompt()
+        assert "by Elie Wiesel" not in txt, "尾部内容不该与头部拼在一起制造错觉"
+
+    def test_reports_how_many_lines_were_dropped(self):
+        st = PageState(body_text=_page2_like_body())
+        txt = st.render_for_prompt()
+        assert "行未显示" in txt, "要如实告诉模型有多少内容没看到，它才知道该 scroll"
+
+    def test_default_budget_covers_the_measured_real_pages(self):
+        """预算依据是实测的三页长度（1668 / 3449 / 2029）。
+
+        这条是防回归的：有人把预算调回 1500，t02 就会重新变成残缺观察。
+        """
+        st = PageState(body_text="x" * 2029)  # books.toscrape.com 首页的长度
+        txt = st.render_for_prompt()
+        assert "行未显示" not in txt, "2029 字的真实页面应当完整呈现"
+
+
+# ---------------------------------------------------------------------------
 # JS 侧：区域判断
 #
 # 纯 Python 测得再全也测不到 JS，而"区域判断"正是在 JS 里做的 ——

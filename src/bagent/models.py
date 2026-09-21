@@ -36,6 +36,16 @@ class Action(BaseModel):
     key: Optional[str] = Field(default=None, description="press 用：按键名")
     dy: Optional[int] = Field(default=None, description="scroll 用：滚动像素，正数向下")
     answer: Optional[str] = Field(default=None, description="finish 用：最终结论")
+    # finish 用：从**当前页面正文**里逐字复制的一段原文，用来支撑 answer。
+    #
+    # 为什么要有这个字段：真实轨迹里出现过"引用的句子是对的、作者配错了"
+    # （名言与作者对错行）和"假设列表已按价格排序、没逐条比价"这两类错答，
+    # 而引擎原来对 answer 不做任何核对，写什么收什么。
+    # 强制逐字复制之后，模型必须先"回到页面上抄一遍"，而不是凭记忆收尾。
+    # 核对逻辑见 grounding.check_grounding。
+    evidence: Optional[str] = Field(
+        default=None, description="finish 用：从当前页面正文里逐字复制的证据原文"
+    )
 
 
 class Usage(BaseModel):
@@ -79,6 +89,55 @@ class Element(BaseModel):
     region: str = "neutral"
 
 
+def _elide_ordered(text: str, budget: int) -> str:
+    """按**行**截断，保序、**不拼接尾部**。
+
+    ## 为什么不能写成 head + tail（这是被真实轨迹打出来的）
+
+    旧写法是 `text[:budget//2] + "…（中间省略）…" + text[-budget//2:]`，
+    看着挺省，实际会**凭空造出页面上并不存在的相邻关系**。
+
+    实测 `quotes.toscrape.com/page/2/`（正文 3449 字）：
+
+        「This life is what you make it…」   offset 26   → 进 head
+        「by Marilyn Monroe」              offset 1110 → 落进被省略的中间
+        「by Elie Wiesel」                 offset 2708 → 进 tail
+
+    于是模型收到的观察里：**第一句的正文在、它的作者不在，而 tail 里
+    孤零零躺着一个别人的作者名**。它把两者配成一对，答成 Elie Wiesel ——
+    连续三轮稳定复现。
+
+    这不是模型在幻觉，是**我们喂给它的观察本身就是残缺且误导的**：
+    拿"看见 A 和 D、但看不见 B 和 C"去问"A 后面是什么"，答错是必然的。
+
+    所以截断必须保序：只保留连续的**头部整行**，然后如实说明还有多少行没显示。
+    丢掉尾部是诚实的（模型知道"后面还有内容、要看就 scroll"）；
+    拼接头部和尾部是欺骗性的（模型会以为它们相邻）。
+
+    ## 为什么按行而不是按字符
+
+    按字符切会把一行从中间劈开（"by Marilyn Mo"），那同样是造伪证据。
+    整行切完，剩下的每一行都是页面上真实存在的完整一行。
+    """
+    if len(text) <= budget:
+        return text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    kept: list[str] = []
+    used = 0
+    for ln in lines:
+        if used + len(ln) + 1 > budget:
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    dropped = len(lines) - len(kept)
+    if not kept:  # 极端情况：单行就超预算
+        return text[:budget] + "\n…（本页这一行太长已截断，后续内容未显示）"
+    return "\n".join(kept) + (
+        f"\n…（本页正文还有 {dropped} 行未显示。以上内容与未显示部分**不相邻**，"
+        f"要看后面的内容请用 scroll，或再 extract 一次，不要凭记忆推断。）"
+    )
+
+
 class PageState(BaseModel):
     """一帧页面感知结果——这就是 Agent 的"眼睛"。"""
 
@@ -89,8 +148,22 @@ class PageState(BaseModel):
     body_text: str = ""
     screenshot_path: str = ""
 
-    def render_for_prompt(self, max_body_chars: int = 1500) -> str:
-        """渲染成给模型看的纯文本。控制长度就是控制成本。"""
+    def render_for_prompt(self, max_body_chars: int = 3000) -> str:
+        """渲染成给模型看的纯文本。控制长度就是控制成本。
+
+        ## 预算 1500 → 3000 的依据（实测，不是拍的）
+
+        在真实站点上量了三个关键页面的正文长度：
+
+            quotes.toscrape.com/           1668 字
+            quotes.toscrape.com/page/2/    3449 字
+            books.toscrape.com/            2029 字
+
+        1500 的预算会把**三个页面里的两个**切成残缺状态 —— 而残缺的正文摘要
+        正是 t02 答错作者的直接原因（详见 `_elide_ordered`）。
+        3000 能让两页完整呈现、第三页只丢尾部，而丢掉的尾部模型自己会 scroll 补。
+        多出来的 token 是明码标价的，换来的是"观察不再骗人"，这笔账划算。
+        """
         lines = [
             f"当前网址: {self.url}",
             f"页面标题: {self.title}",
@@ -117,9 +190,7 @@ class PageState(BaseModel):
 
         body = (self.body_text or "").strip()
         if body:
-            if len(body) > max_body_chars:
-                body = body[: max_body_chars // 2] + "\n...（中间省略）...\n" + body[-max_body_chars // 2 :]
-            lines += ["", "页面正文摘要:", body]
+            lines += ["", "页面正文摘要:", _elide_ordered(body, max_body_chars)]
         return "\n".join(lines)
 
 

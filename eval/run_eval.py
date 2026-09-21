@@ -226,6 +226,13 @@ async def run_task(task: dict, settings, max_steps: int | None) -> dict:
         "cost_yuan": result.cost_yuan,
         "error": result.error,
         "run_dir": result.run_dir,
+        # 证据锚定（见 bagent/grounding.py）。把它带出来是为了让"结论有没有
+        # 页面依据"变成**可观测的**，而不是只写在 trace 里没人看：
+        # grounded=True 表示这次的结论通过了逐字证据核对 —— 它与"判分通过"
+        # 是两件事（判分看内容对不对，这里看结论有没有来源），必须分开报。
+        "grounded": bool(getattr(result, "grounded", False)),
+        "grounding_retries": int(getattr(result, "grounding_retries", 0) or 0),
+        "grounding_note": getattr(result, "grounding_note", ""),
     }
 
 
@@ -314,6 +321,24 @@ def summarize(rows: list[dict], skipped: list[dict] | None = None) -> dict:
     }
 
 
+def _ground_label(row: dict) -> str:
+    """把一次运行的证据核对结果渲染成一个短标签。
+
+    三种状态必须能一眼分开，否则"未核对"会冒充"已核对"：
+
+    - `已核对`：结论通过了逐字证据核对；
+    - `退回N次`：核对没过、退回重做了 N 次（哪怕最后答案碰巧对了，
+      也说明它是**被逼着**才回去读页面的）；
+    - `免检/未核对`：拒答类结论或页面无正文 —— 是"核不了"，不是"核过了"。
+    """
+    if row.get("grounded"):
+        return "[green]已核对[/green]"
+    n = int(row.get("grounding_retries") or 0)
+    if n:
+        return f"[yellow]退回{n}次[/yellow]"
+    return "[dim]免检[/dim]"
+
+
 def print_report(
     rows: list[dict],
     stats: dict,
@@ -333,7 +358,7 @@ def print_report(
         console.print(sk)
 
     table = Table(show_header=True, header_style="bold", title="逐次结果（自动判分）")
-    for col in ("ID", "类型", "第几次", "结果", "步数", "token", "耗时(s)", "判定说明"):
+    for col in ("ID", "类型", "第几次", "结果", "证据", "步数", "token", "耗时(s)", "判定说明"):
         table.add_column(col)
     seen: dict[str, int] = {}
     for r in scored:
@@ -343,6 +368,7 @@ def print_report(
             r["kind"],
             f"{seen[r['id']]}/{repeat}" if repeat > 1 else "-",
             "[green]通过[/green]" if r["ok"] else "[red]失败[/red]",
+            _ground_label(r),
             str(r["steps"]),
             str(r["total_tokens"]),
             str(r["elapsed"]),
@@ -413,6 +439,12 @@ def print_report(
     s.add_row("平均 token", str(stats["avg_tokens"]))
     s.add_row("平均成本", f"¥{stats['avg_cost_yuan']:.6f}")
     s.add_row("平均耗时", f"{stats['avg_elapsed']} 秒")
+    # 证据锚定的汇总：这一行回答的是"这些结论有多少条真的落在了页面上"，
+    # 与成功率是**两个正交的维度**（可能答对但没证据、也可能有证据但答错）。
+    if scored:
+        g = sum(1 for r in scored if r.get("grounded"))
+        retried = sum(1 for r in scored if int(r.get("grounding_retries") or 0))
+        s.add_row("结论带页面证据", f"{g}/{len(scored)}（其中 {retried} 条被退回重做后才收尾）")
     console.print(s)
 
 

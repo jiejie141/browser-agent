@@ -23,8 +23,9 @@
       "kind": "normal",
       "task": "在书籍网站首页找到售价最高的那本书，读出书名和价格。",
       "url": "https://books.toscrape.com/",
-      "must_contain": ["A Light in the Attic", "59.99"],
-      "expected": "书名 + 价格"
+      "must_contain": ["Our Band Could Be", "57.25"],
+      "expected": "书名 + 价格：首页最高价 £57.25 = 《Our Band Could Be Your Life...》",
+      "_truth_source": "⚠️ 这条的真值**改正过**。原写 must_contain=[\"A Light in the Attic\",\"59.99\"]，是凭印象写的、事实错误 —— 用换通道方式（HTTP 直接抓首页 price_color 再排序）核对：首页 20 本书最高价是 £57.25（Our Band Could Be Your Life...），A Light in the Attic 只有 £51.77，首页压根没有 £59.99。Agent 三轮答的都是 £57.25 —— 是它对了、判分错了（假阴性），不是能力缺口。真值有疑就必须换通道核，别拿浏览器里那一帧当唯一信源。"
     },
     {
       "id": "t04",
