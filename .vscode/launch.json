@@ -95,9 +95,11 @@
       "justMyCode": false
     },
     {
-      // 基线只有 6 个任务、跑一次得不出可信数字：实测三轮分别是 3/6、2/6、3/6。
+      // 基线只有 6 个任务、跑一次得不出可信数字。
       // 这个配置就是用来量方差的 —— 跑完看 pass@3 与 pass^3 的差距，
       // 两者差得多说明是稳定性问题，不是能力问题。
+      // 2026-09-21 修完 t02 截断、改正 t03 真值后实测：单轮 5/6、6/6、4/6，
+      // 合计 15/18，pass@3 6/6 对 pass^3 3/6。
       "name": "⑤b 基线 × 3 轮（量稳定性 pass@3 / pass^3）",
       "type": "debugpy",
       "request": "launch",
@@ -116,6 +118,21 @@
       "request": "launch",
       "program": "${workspaceFolder}/eval/run_eval.py",
       "args": ["--task-file", "tasks/real_sites.json"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": { "PYTHONIOENCODING": "utf-8" },
+      "justMyCode": false
+    },
+    {
+      // 2026-09-21 修的那两条之一：t02 曾经 0/3，原因不是模型笨，
+      // 是正文摘要按"头 750 + 中间省略 + 尾 750"拼，把"首句正文"和
+      // "它自己的作者"切散了。改成保序截断后 3/3。
+      // 跑完重点看两处：①「过/共」是不是 3/3；②表格里的「证据」列。
+      "name": "⑤d 只跑 t02（看这次的修复）×3",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval/run_eval.py",
+      "args": ["--only", "t02", "--repeat", "3"],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "env": { "PYTHONIOENCODING": "utf-8" },
