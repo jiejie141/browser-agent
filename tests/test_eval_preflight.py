@@ -22,10 +22,34 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "eval"))
 
 import run_eval  # noqa: E402
+
+
+class _SettingsStub:
+    """只带 `validate()` 的替身。
+
+    ⚠️ 这一条是被 CI 打脸才补上的：`run_eval.main()` 里会调
+    `settings.validate()`，而它**在缺 LLM_API_KEY 时直接抛 RuntimeError**。
+    本地有 `.env` 所以怎么跑都绿，推上去 CI 上没有 key →
+    "运行测试" 这步 6 秒就红了（其余 42 条用例全过，只有这两条挂）。
+
+    教训：**单测不该依赖密钥**。它测的是"闸门接线对不对"，
+    跟有没有 key 毫无关系 —— 把外部依赖摘掉才是单测该干的事。
+    """
+
+    def validate(self) -> None:
+        return None
+
+
+@pytest.fixture
+def no_llm_key(monkeypatch):
+    """把 settings 换成不需要 key 的替身。"""
+    monkeypatch.setattr(run_eval, "get_settings", lambda **_kw: _SettingsStub())
 
 
 def _row(rid: str, ok: bool, kind: str = "normal", scored: bool = True) -> dict:
@@ -151,7 +175,7 @@ class TestPreflightGate:
         res = asyncio.run(run_eval.preflight(["file:///tmp/a.html", "file:///tmp/b.html"]))
         assert res == {}
 
-    def test_all_skipped_returns_nonzero(self, tmp_path, monkeypatch, capsys):
+    def test_all_skipped_returns_nonzero(self, tmp_path, monkeypatch, capsys, no_llm_key):
         """全部被预检拦下 → 返回 1，且写不出假的成功率。"""
         task_file = tmp_path / "net_dependent.json"
         task_file.write_text(
@@ -179,7 +203,7 @@ class TestPreflightGate:
         assert rc == 1, "全部跳过时不能返回 0"
         assert "环境预检" in capsys.readouterr().out
 
-    def test_explicit_no_preflight_runs_everything(self, tmp_path, monkeypatch):
+    def test_explicit_no_preflight_runs_everything(self, tmp_path, monkeypatch, no_llm_key):
         """--no-preflight 必须真的把闸门关掉（否则离线任务集会被误伤）。"""
         called = {"n": 0}
 
