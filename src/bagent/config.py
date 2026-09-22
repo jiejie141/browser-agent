@@ -10,12 +10,25 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 # 项目根目录：src/bagent/config.py -> src/bagent -> src -> 项目根
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# **必须在 load_dotenv 之前快照**。load_dotenv 默认不覆盖已存在的环境变量，
+# 所以加载之后 os.environ 里就分不清"这个值是真环境给的"还是".env 给的"了。
+# 而这两者的含义完全不同：真环境是部署时显式传入的，.env 是本机遗留的副本 ——
+# 本机这份就曾经把 MAX_STEPS 悄悄按在 20，而代码默认值早已改成 30。
+_PROCESS_ENV_SNAPSHOT = dict(os.environ)
+
 load_dotenv(PROJECT_ROOT / ".env")
+
+try:
+    _ENV_FILE_VALUES: dict[str, str | None] = dict(
+        dotenv_values(PROJECT_ROOT / ".env") or {}
+    )
+except Exception:  # 文件不存在/语法坏了都不该让 import 崩掉
+    _ENV_FILE_VALUES = {}
 
 
 def _get(name: str, default: str = "") -> str:
@@ -30,6 +43,49 @@ def _get_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def resolve_int(name: str, default: int) -> tuple[int, str]:
+    """解析一个整数配置，并**如实回报它是从哪儿来的**。
+
+    为什么要回报来源：生效值相同的两份配置，含义可以完全不同。
+    本机实测踩过一次——`config.py` 把 `max_steps` 默认值改成 30 之后，
+    `.env` 里那句遗留的 `MAX_STEPS=20` 仍然赢，于是"改了代码"和
+    "改了配置"完全看不出区别，跑到一半才发现基线还在旧预算上。
+    参数值会改变结论，那么**它的来源也是结论的一部分**。
+
+    来源只有三种，优先级从高到低：进程环境变量 > .env 文件 > 代码默认值。
+    返回 (生效值, 来源说明)；调用方要自己把来源打出来或落盘。
+
+    值存在但解析不出来（例如 `MAX_STEPS=abc`）时，生效值退回 `default`，
+    **但来源照实写成"值不可解析"** —— 不能让一个写坏的值看起来像生效了。
+    """
+    snap = (_PROCESS_ENV_SNAPSHOT.get(name) or "").strip()
+    if snap:
+        parsed = _parse_int(snap)
+        if parsed is not None:
+            return parsed, "环境变量"
+        return default, f"环境变量（{name}={snap!r} 不可解析，已回退默认值）"
+    file_val = (_ENV_FILE_VALUES.get(name) or "").strip()
+    if file_val:
+        parsed = _parse_int(file_val)
+        if parsed is not None:
+            return parsed, ".env 文件"
+        return default, f".env 文件（{name}={file_val!r} 不可解析，已回退默认值）"
+    return default, "代码默认值"
+
+
+def _parse_int(raw: str) -> int | None:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# 步数预算的**代码默认值**，单独抽出来给两处用：Settings 的默认值、
+# 以及报告里"这个生效值是默认值还是被覆盖了"的判断。写成两遍就等于
+# 给下一次漂移留了口子（.env 与本文件各写一个数，谁也说不清哪个生效）。
+MAX_STEPS_DEFAULT = 30
 
 
 def _get_float(name: str, default: float) -> float:
@@ -97,7 +153,9 @@ class Settings:
     # 类似的事 —— 真卡住的运行会被提前熔断，不需要靠预算兜。而 t05/t06 那种
     # "每一步都在换页面、就是不给结论"的形态，判据上**不构成停滞**
     # （实测最大停滞计数只有 1~4，阈值是 6），动态延长对它无效，只有加预算有效。
-    max_steps: int = field(default_factory=lambda: _get_int("MAX_STEPS", 30))
+    max_steps: int = field(
+        default_factory=lambda: _get_int("MAX_STEPS", MAX_STEPS_DEFAULT)
+    )
     step_timeout_seconds: int = field(
         default_factory=lambda: _get_int("STEP_TIMEOUT_SECONDS", 30)
     )

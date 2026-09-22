@@ -48,7 +48,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from bagent.agent import ReActAgent, new_run_dir  # noqa: E402
 from bagent.browser import open_browser, proxy_launch_kwargs  # noqa: E402
-from bagent.config import get_settings  # noqa: E402
+from bagent.config import MAX_STEPS_DEFAULT, get_settings, resolve_int  # noqa: E402
 from bagent.llm import build_client  # noqa: E402
 from bagent.siteprobe import looks_like_throttle  # noqa: E402
 
@@ -56,6 +56,22 @@ console = Console()
 
 # 预检超时。比正式跑短：预检只回答"能不能连上"，不需要等页面渲染完。
 PREFLIGHT_TIMEOUT_MS = 20000
+
+
+def resolve_budget(cli_value: int | None) -> tuple[int, str]:
+    """定下这次跑用的步数预算，并如实回报它是从哪儿来的。
+
+    抽成独立函数是为了能被测试直接钉住 —— 这段逻辑原先写在 `main()` 里，
+    而它恰恰是本项目**真的踩过**的一类坑：`config.py` 把默认值从 20 改成 30
+    之后，本机 `.env` 里那句遗留的 `MAX_STEPS=20` 仍然赢，跑了十分钟才从
+    轨迹里看到"达到最大步数上限（20）"。参数值会改变结论，所以
+    "用的是哪一档、谁定的"必须是一等公民，而不是靠人去翻 `.env`。
+
+    优先级：命令行 > 进程环境变量 / .env > 代码默认值。
+    """
+    if cli_value:
+        return cli_value, "命令行 --max-steps"
+    return resolve_int("MAX_STEPS", MAX_STEPS_DEFAULT)
 
 
 async def preflight(urls: list[str], *, min_interval: float = 1.0) -> dict[str, tuple[bool, str]]:
@@ -633,12 +649,22 @@ def main(argv: list[str] | None = None) -> int:
     # 打出来是为了**模型层消融**能对账：两份结果比之前先看清模型号，
     # 才不会把"换了模型"的差异误记成"改了代码"的效果。
     # 步数预算同理 —— 它也会改变结论（见 run_task 里的说明），所以一起打在头部，
-    # 并写进明细文件的每一条记录。
-    effective_max_steps = args.max_steps or settings.max_steps
+    # 并写进明细文件与报告顶层。预算还要连**来源**一起打，理由见 resolve_budget。
+    effective_max_steps, budget_source = resolve_budget(args.max_steps)
+    budget_note = ""
+    if budget_source != "代码默认值" and effective_max_steps != MAX_STEPS_DEFAULT:
+        budget_note = f"，覆盖代码默认值 {MAX_STEPS_DEFAULT}"
     console.print(
         f"[dim]模型 {settings.llm_model} ｜ 引擎 {settings.engine} "
-        f"｜ 步数预算 {effective_max_steps} ｜ 任务集 {Path(args.task_file).name}[/dim]"
+        f"｜ 步数预算 {effective_max_steps}（来自 {budget_source}{budget_note}）"
+        f" ｜ 任务集 {Path(args.task_file).name}[/dim]"
     )
+    if budget_source != "代码默认值" and effective_max_steps != MAX_STEPS_DEFAULT:
+        console.print(
+            f"[yellow]注意：步数预算被 {budget_source} 按在 {effective_max_steps}"
+            f"（代码默认值 {MAX_STEPS_DEFAULT}）。跨版本对比必须对齐这一档，"
+            f"否则会把预算差异读成代码改动的效果。[/yellow]"
+        )
 
     data = json.loads(Path(args.task_file).read_text(encoding="utf-8"))
     tasks = data.get("tasks", data)
@@ -708,6 +734,13 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "stats": stats,
+                # 这两个写在**文件顶层**，不只是每条明细里：拿两份 eval_*.json
+                # 做版本对比时，第一眼就该看清"预算是不是同一档、它是从哪儿来的"。
+                # 明细里每条也有 max_steps，那是给逐条排查用的。
+                "max_steps": effective_max_steps,
+                "max_steps_source": budget_source,
+                "max_steps_default": MAX_STEPS_DEFAULT,
+                "model": settings.llm_model,
                 "repeat": args.repeat,
                 "per_task": repeat_stats(runs, args.repeat),
                 "runs": runs,
