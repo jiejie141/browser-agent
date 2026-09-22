@@ -1012,9 +1012,9 @@ token        输入 8432 / 输出 1105 / 共 9537
   编号是**全局**的（main 与 iframe 共用 1..N），模型不需要知道元素在哪个
   frame；动作层按编号**自己挨个 frame 找过去**（`browser._locate_ref`）。
   主文档正文短于 400 字时，还会把 iframe 的正文补进来（并标注来源）。
-  ⚠️ 两个限制：**只扫前 6 个 frame**（广告 iframe 一页能挂几十个，
-  全扫会吃掉步数预算），以及**只覆盖同源与跨源的普通 iframe**
-  （Playwright 工作在浏览器层，不受同源策略限制，这是它能做到的原因）。
+  ⚠️ 限制：**只扫前 6 个 frame**（`MAX_FRAMES`）—— 广告 iframe 一页能挂几十个，
+  全扫一遍每步多几十次跨进程 evaluate，会吃掉步数预算，排在第 7 个之后的
+  就漏了。跨域 iframe 不受影响：Playwright 工作在浏览器层，拿得到子 frame。
 - ✅ **Shadow DOM 现在会解析**（2026-09-22，见第八节 8.21）
   ~~不解析 Shadow DOM。~~ 采集 JS 会递归下钻 **open** 模式的 `shadowRoot`，
   正文抽取同理。点击不需要特殊处理 —— Playwright 的 CSS 选择器默认穿透
