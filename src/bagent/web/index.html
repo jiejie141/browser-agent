@@ -253,7 +253,10 @@ code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); paddi
         <button class="btn btn-primary" id="gosearch">去搜索</button>
       </div>
       <div class="sitehint" id="sitehint">
-        <span class="muted">支持 60+ 站点（综合搜索 / 电商 / 视频 / 社交 / 求职 / 财经 / 新闻 …）。</span>
+        <!-- 这一行只是 /sites 返回前的占位；loadSites() 会用真实条数覆盖它。
+             所以这里刻意**不写数字**：写死过 "60+"，站点表涨到 64 之后就成了假话，
+             而占位内容没人会记得跟着改。数字一律交给接口给。 -->
+        <span class="muted">正在加载站点列表…（综合搜索 / 电商 / 视频 / 社交 / 知识技术 / 求职 / 财经 / 新闻 等）</span>
       </div>
       <div class="quick-label">或者点一个现成例子</div>
       <div class="quick">
