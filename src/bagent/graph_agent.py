@@ -57,7 +57,9 @@ from .agent import (
     STALL_STOP_AT,
     STALL_WARN_AT,
     SYSTEM_PROMPT,
+    HISTORY_WINDOW,
     RunResult,
+    trim_history,
     LoginHandoff,
     StepCallback,
     _action_signature,
@@ -188,7 +190,7 @@ class AgentState(TypedDict, total=False):
 
 def _note(state: AgentState, text: str) -> list[str]:
     """往历史里追加一条，并裁到最近 12 条（与手写引擎一致，控制 prompt 长度）。"""
-    return (list(state.get("history") or []) + [text])[-12:]
+    return trim_history(list(state.get("history") or []) + [text])
 
 
 # ---------------------------------------------------------------------------
@@ -432,14 +434,15 @@ class LangGraphReActAgent:
             "just_logged_in": False,
         }
         if len(history) != len(state.get("history") or []):
-            out["history"] = history[-12:]
+            out["history"] = trim_history(history)
         return out
 
     async def _node_reason(self, state: AgentState) -> dict:
         st = state.get("page_state")
         prompt = self._build_prompt(state.get("task", ""), st, state.get("history") or [])
         try:
-            raw = self.llm.chat(
+            # 与手写引擎一致：走 achat，别让同步 SDK 卡住事件循环
+            raw = await self.llm.achat(
                 [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -680,7 +683,7 @@ class LangGraphReActAgent:
                     f"(b) 直接调用 finish 给出结论。"
                     f"如果你已经能从页面正文里看到答案，请立刻 finish。"
                 ]
-            )[-12:]
+            )[:HISTORY_WINDOW]
         return out
 
     # ------------------------------------------------------------------

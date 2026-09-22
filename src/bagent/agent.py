@@ -17,6 +17,7 @@ Agent 会看到变化并自己绕路。
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -308,8 +309,6 @@ def page_fingerprint(state) -> str:
     应该和"视觉通道到底有多少收益"一起评估，不该塞在这次的修复里悄悄做掉。
     记在这里，等它真的成为瓶颈再动。
     """
-    import hashlib
-
     parts = [
         state.url or "",
         state.title or "",
@@ -403,6 +402,19 @@ def oscillation_warning(pages: int) -> str:
         f"来回走只说明你没走对路。只有当你已经站在正确的页面上、"
         f"确实确认过这件事无法完成，才把结论写成「做不到」；否则先换做法。"
     )
+
+
+# 喂给模型的历史保留多少条。控制 prompt 长度就是控制成本。
+#
+# ⚠️ 抽成常量是因为这个数原来在代码里**散着写了 5 遍**（agent.py 4 处 +
+# graph_agent 的 _note 1 处）。想调一次 prompt 成本得改 5 个地方，
+# 漏一个就会出现"实际生效的窗口和以为的不一样"这种最难查的偏差。
+HISTORY_WINDOW = 12
+
+
+def trim_history(history: list[str]) -> list[str]:
+    """裁到最近 `HISTORY_WINDOW` 条，返回新列表（调用方要接住返回值）。"""
+    return history[-HISTORY_WINDOW:]
 
 
 # 登录墙的提示至少隔几步重发一次。不节流的后果和振荡警告一样：
@@ -621,7 +633,7 @@ class ReActAgent:
                             f"第 {step} 步: 登录已完成，已重新打开任务入口 {start_url}。"
                             f"现在按任务要求去找内容 —— 顺序是**先登录后找内容**，不要反过来。"
                         )
-                        history = history[-12:]
+                        history = trim_history(history)
                         continue
 
                 # 没有交接通道，或交接没成功 → 明确告诉它"停下来"，并节流。
@@ -690,7 +702,9 @@ class ReActAgent:
             user_prompt = self._build_prompt(task, state, history)
             raw = ""
             try:
-                raw = self.llm.chat(
+                # 用 achat 而不是 chat：同步 SDK 会卡住事件循环，
+                # 那段时间里浏览器的加载/等待全停摆（见 llm.achat 的说明）。
+                raw = await self.llm.achat(
                     [
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt},
@@ -764,7 +778,7 @@ class ReActAgent:
                         "请重新读一遍「页面正文摘要」，把支撑结论的原文**原样复制**到 evidence，"
                         "并确认 answer 里的每个人名 / 数字 / 标题都出现在这段原文里，再调用 finish。"
                     )
-                    history = history[-12:]
+                    history = trim_history(history)
                     continue
 
                 finished = True
@@ -830,7 +844,7 @@ class ReActAgent:
                     '请立刻输出 {"action": "finish", "answer": "..."} —— '
                     "把你能确定的结论写进 answer 就够了。"
                 )
-                history = history[-12:]
+                history = trim_history(history)
                 continue
 
             if action.action == "extract":
@@ -864,7 +878,7 @@ class ReActAgent:
             if not outcome_ok:
                 desc += "（不要重复这个动作）"
             history.append(desc)
-            history = history[-12:]  # 只保留最近 12 步，控制 prompt 长度
+            history = trim_history(history)  # 只保留最近 12 步，控制 prompt 长度
 
             consecutive_failures = 0 if outcome_ok else consecutive_failures + 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:

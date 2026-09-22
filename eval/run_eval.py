@@ -46,7 +46,8 @@ from rich.table import Table
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from bagent.agent import ReActAgent, new_run_dir  # noqa: E402
+from bagent.agent import new_run_dir  # noqa: E402
+from bagent.graph_agent import build_agent  # noqa: E402
 from bagent.browser import open_browser, proxy_launch_kwargs  # noqa: E402
 from bagent.config import MAX_STEPS_DEFAULT, get_settings, resolve_int  # noqa: E402
 # "拒答"词表只有这一份来源（引擎免检与判分必须同口径，见 judge() 里的说明）
@@ -360,7 +361,10 @@ def judge(task: dict, result) -> tuple[bool, str]:
 async def run_task(task: dict, settings, max_steps: int | None) -> dict:
     run_dir = new_run_dir(settings, tag=task["id"])
     llm = build_client(settings)
-    agent = ReActAgent(settings, llm=llm)
+    # 用 build_agent 而不是直接 new ReActAgent：报告头部会打印 settings.engine，
+    # 而直接写死 ReActAgent 意味着 ENGINE=langgraph 时报告写着 langgraph、
+    # 实际跑的却是手写引擎 —— 数字和口径对不上，还查不出为什么。
+    agent = build_agent(settings, llm=llm)
 
     async def deny(_prompt: str) -> bool:
         # 评测环境是非交互的，敏感操作一律拒绝（与生产默认值保持一致）

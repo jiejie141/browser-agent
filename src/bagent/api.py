@@ -43,7 +43,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .agent import new_run_dir
-from .browser import open_browser
+from .browser import open_browser, safe_url
 from .config import get_settings
 from .graph_agent import build_agent
 from .llm import LLMError, MockLLMClient, build_client
@@ -146,15 +146,27 @@ def console() -> FileResponse:
 # ---------------------------------------------------------------------------
 # 端点
 # ---------------------------------------------------------------------------
+def _langgraph_available() -> bool:
+    """langgraph 是否可用。**结果只算一次** —— 它是一个不会变的导入结果，
+    没必要每次健康检查都去 import 一遍。"""
+    global _LANGGRAPH_OK
+    if _LANGGRAPH_OK is None:
+        try:
+            import langgraph  # noqa: F401
+
+            _LANGGRAPH_OK = True
+        except ImportError:
+            _LANGGRAPH_OK = False
+    return _LANGGRAPH_OK
+
+
+_LANGGRAPH_OK: bool | None = None
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict[str, Any]:
     st = get_settings()
-    try:
-        import langgraph  # noqa: F401
-
-        lg = True
-    except ImportError:
-        lg = False
+    lg = _langgraph_available()
     return {
         "status": "ok",
         "engine_default": getattr(st, "engine", "handwritten"),
@@ -168,7 +180,11 @@ def health() -> dict[str, Any]:
 def engines() -> dict[str, Any]:
     return {
         "default": getattr(get_settings(), "engine", "handwritten"),
-        "available": ["handwritten", "langgraph"],
+        # 列"可用"之前先看装没装：把没装的引擎也列成可选，
+        # 前端会让你选一个注定报错的选项。
+        "available": (
+            ["handwritten", "langgraph"] if _langgraph_available() else ["handwritten"]
+        ),
         "note": "handwritten 零额外依赖；langgraph 需要 pip install langgraph",
     }
 
@@ -229,6 +245,13 @@ def create_task(req: TaskRequest, bg: BackgroundTasks) -> TaskCreated:
         raise HTTPException(
             400, "未配置 LLM_API_KEY。请在 .env 里配置，或用 mock=true 走离线替身。"
         )
+
+    # 网址白名单：与浏览器动作层共用同一份判定（bagent.browser.safe_url）。
+    # 为什么入口就要拦一次：模型读的是网页内容，而任务url 也一样会被送进浏览器；
+    # 拦在入口，坏请求连任务都不会建，而不是跑起来才发现第一步就失败。
+    _, why = safe_url(req.url)
+    if why:
+        raise HTTPException(400, why)
 
     tid = uuid.uuid4().hex[:12]
     _TASKS[tid] = {

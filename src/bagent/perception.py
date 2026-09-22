@@ -349,6 +349,19 @@ def detect_login_wall(
 _HAS_PASSWORD_JS = "() => document.querySelectorAll('input[type=password]').length > 0"
 
 
+def _looks_maybe_login(url: str, title: str, body_text: str) -> bool:
+    """网址或文案**有那么一点像**登录页 —— 用来决定要不要去查密码框。
+
+    注意这只是个**省一次 evaluate 的前置过滤**，不是判定本身：
+    真正的判定仍然在 `detect_login_wall` 里，规则没变、结果没变。
+    """
+    u = (url or "").lower()
+    low = f"{title or ''}\n{body_text or ''}".lower()
+    if _LOGIN_URL_RE.search(u):
+        return True
+    return any(m.lower() in low for m in _LOGIN_TEXT_MARKERS)
+
+
 async def extract_body_text(page: Page, max_chars: int = 4000) -> str:
     """读正文。优先主内容区，避免几千字的导航/页脚把正文淹掉。"""
     try:
@@ -389,11 +402,16 @@ async def perceive(
 
     # 登录墙识别放在**元素抽取之后**：有没有密码框是一个更强的信号，
     # 但它必须和网址/文案合起来看（单凭密码框会误伤带侧栏登录框的内容页）。
+    #
+    # ⚠️ 密码框探测**只在网址或文案已经有点像登录页时才做**：
+    # 每一步都多跑一次 `page.evaluate` 是纯浪费（感知是每步都跑的），
+    # 而"网址不像、文案也没有登录字眼"的页面上，密码框这个信号根本用不上。
     has_pwd = False
-    try:
-        has_pwd = bool(await page.evaluate(_HAS_PASSWORD_JS))
-    except Exception:  # 页面正在跳转时 evaluate 会失败，按"没有密码框"继续
-        has_pwd = False
+    if _looks_maybe_login(url, title, body_text):
+        try:
+            has_pwd = bool(await page.evaluate(_HAS_PASSWORD_JS))
+        except Exception:  # 页面正在跳转时 evaluate 会失败，按"没有密码框"继续
+            has_pwd = False
     is_wall, wall_reason = detect_login_wall(
         url, title, body_text, has_password_field=has_pwd
     )

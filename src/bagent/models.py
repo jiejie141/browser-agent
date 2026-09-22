@@ -404,6 +404,21 @@ def parse_action(raw: str) -> tuple[Action | None, str]:
     except json.JSONDecodeError as exc:
         return None, f"JSON 解析失败({exc})，原始内容: {candidate[:200]}"
 
+    # ⚠️ 模型偶尔会返回一个**数组**（`[{"action": ...}]`）。
+    # 直接 `Action(**data)` 会抛 `TypeError`（**不是** ValidationError，
+    # 下面的 except 接不住），一路穿到主循环里把整轮任务打挂 ——
+    # 而这本该只是"这一步格式不对"，和别的格式错误同一待遇。
+    # 单元素数组里确实是动作对象时，取它出来；否则按格式错误如实报。
+    if isinstance(data, list):
+        if len(data) == 1 and isinstance(data[0], dict):
+            data = data[0]
+        else:
+            return None, (
+                f"期望一个 JSON 对象，实际收到数组（{len(data)} 个元素）。"
+                f"请只输出一个对象，例如 {{\"action\": \"finish\", \"answer\": \"...\"}}"
+                f"（模型原始输出: {candidate[:120]}）"
+            )
+
     data, norm_err = _normalize_action_fields(data)
     if norm_err:
         # 原始输出要带出去：报错最终会进模型的下一轮 prompt，

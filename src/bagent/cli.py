@@ -267,9 +267,25 @@ def doctor(settings, mock: bool = False) -> int:
 
 
 def load_task_file(path: Path) -> list[dict]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    """读任务集。
+
+    两种最常见的失败**必须给得出人话**：
+      - 文件不存在 → 原来是一段 `FileNotFoundError` 堆栈；
+      - JSON 写坏了 → 原来是一段 `JSONDecodeError` 堆栈（而且不告诉你是哪一行）。
+    这两件事使用者 5 秒就能自己修好，前提是你得告诉他是什么错了。
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"任务文件不存在: {path}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"任务文件不是合法 JSON（第 {exc.lineno} 行附近）: {path}") from exc
     if isinstance(data, dict):
         data = data.get("tasks", [])
+    if not isinstance(data, list):
+        raise RuntimeError(f"任务文件里 tasks 应该是数组，实际是 {type(data).__name__}: {path}")
     return data
 
 
@@ -357,7 +373,11 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.task_file:
-            tasks = load_task_file(Path(args.task_file))
+            try:
+                tasks = load_task_file(Path(args.task_file))
+            except RuntimeError as exc:
+                console.print(f"[red]{exc}[/red]")
+                return 2
             if args.only:
                 # 越界的 `--only` 原来是 IndexError 崩在终端里。
                 # 对使用者来说那句堆栈毫无信息量 —— 他只想知道"我该填几"。

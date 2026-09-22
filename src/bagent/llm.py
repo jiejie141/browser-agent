@@ -105,6 +105,23 @@ class LLMClient:
             )
         return (resp.choices[0].message.content or "").strip()
 
+    async def achat(self, messages: Sequence[dict[str, Any]], **kwargs) -> str:
+        """`chat()` 的异步版本：把同步的 SDK 调用丢到线程池里。
+
+        ## 为什么必须有它（这是本模块自己写过、却又自己犯了的那个坑）
+
+        SDK 是同步的，而主循环是 `async` 的。在 async 函数里**直接**调用同步网络
+        请求，会把整个事件循环卡住 —— 在那段时间里 Playwright 的等待、截图、
+        浏览器收尾全部停摆。本项目在 `perception._run_sync` 里就写着这条，
+        可主循环里的模型调用一直是同步的，等于文档写对了、代码没照做。
+
+        一次调用通常 1~10 秒（慢模型更久），而这段时间浏览器本来是可以继续
+        加载页面的 —— 让出去是白赚的。
+        """
+        import asyncio
+
+        return await asyncio.to_thread(self.chat, messages, **kwargs)
+
     # ------------------------------------------------------------------
     # 视觉对话（降级通道）
     # ------------------------------------------------------------------
@@ -177,6 +194,15 @@ class LLMClient:
             except openai.BadRequestError as exc:
                 raise LLMError(
                     f"请求被拒绝（通常是模型名写错或参数不支持）: {exc}"
+                ) from exc
+            except openai.APIStatusError as exc:
+                # 兜住**其余所有**服务端错误（404 模型不存在、403 没权限、
+                # 422 参数不合…）。不兜的后果：这些异常会原样穿出去，
+                # 而调用方只捕 LLMError —— 于是"模型名写错"这种最常见的配置问题
+                # 表现成一段裸 traceback，看不出到底是哪个参数错了。
+                raise LLMError(
+                    f"接口返回 {exc.status_code}（{type(exc).__name__}）："
+                    f"{str(exc)[:200]}。请检查 LLM_MODEL / LLM_BASE_URL 是否匹配。"
                 ) from exc
 
         raise LLMError(
