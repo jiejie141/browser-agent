@@ -28,7 +28,7 @@ from typing import Awaitable, Callable
 from .browser import BrowserSession
 from .config import Settings
 from .grounding import MAX_GROUNDING_RETRIES, check_grounding
-from .llm import LLMClient, LLMError, build_client
+from .llm import LLMClient, LLMError, build_client, build_vlm_client
 from .models import Action, StepRecord, Usage, parse_action
 from .perception import perceive
 
@@ -405,6 +405,46 @@ def oscillation_warning(pages: int) -> str:
     )
 
 
+# 登录墙的提示至少隔几步重发一次。不节流的后果和振荡警告一样：
+# 模型不听的时候，每一步都背一段越来越长的话，prompt 迅速膨胀。
+LOGIN_NOTIFY_EVERY = 4
+
+
+def login_blocked_warning(reason: str) -> str:
+    """「这是登录墙，而且没人能登录」时的注入文本。两个引擎共用一份。
+
+    ## 措辞上必须同时说清三件事（少一件就会回到横跳）
+
+    1. **这是一堵墙**，不是"内容页加载慢"；
+    2. **先登录再找内容** —— 顺序不能反（用户反馈的失效形态恰恰是反着的：
+       它一直在找内容，从没认真处理登录这件事）；
+    3. **来回切换没有用** —— 明确禁止"再点一次内容页"。
+
+    ## 为什么这里不替它登录
+
+    引擎没有账号凭据，也不该保存用户密码。"登录"这件事只能由人来完成，
+    引擎能做的是**把门打开**（登录交接，见 `login_handoff`）和
+    **在没人能登录时让它体面地停下**（这一段）。
+    """
+    return (
+        f"⚠ 当前页面需要登录才能看到内容（{reason}），而你**没有可用的账号凭据**。\n"
+        f"正确的顺序是：**先登录，再找内容**。在没有完成登录之前去找内容，"
+        f"只会被弹回这个页面 —— 所以**不要**再在登录页和内容页之间来回切换，"
+        f"那一步都不会带来新信息。\n"
+        "你现在只有两条路：\n"
+        "  (a) 换一个**不需要登录**的入口（例如直接用 goto 打开一个明确的、"
+        "公开可访问的网址）；\n"
+        "  (b) 如果确认无法继续，立刻 finish，在 answer 里写明"
+        "「需要登录，无法完成」（这类结论免检 evidence，不需要引用不存在的东西）。"
+    )
+
+
+# 登录交接：收到 (当前网址, 判定理由)，返回 True 表示"人已经登录好了，继续跑"。
+# 由调用方决定"人怎么登录" —— CLI 是终端里按回车，API 是控制台上点按钮。
+# 引擎只认这个契约，不关心它背后是哪种交互。
+LoginHandoff = Callable[[str, str], Awaitable[bool]]
+
+
 @dataclass
 class RunResult:
     """一次完整运行的产物。评测脚本读的就是这个。"""
@@ -447,6 +487,16 @@ class ReActAgent:
         self.settings = settings
         self.llm = llm or build_client(settings)
         self.on_step = on_step
+        # 视觉通道的客户端。**必须自己造并传给 perceive**：那边判定
+        # `settings.vlm_enabled and vlm is not None`，引擎不传就永远为假 ——
+        # 结果是"截图照拍、描述从来没跑过"，配了 VLM key 也看不出任何区别。
+        # 构造失败不致命（视觉只是降级通道），记一条警告继续走纯 DOM。
+        self.vlm: LLMClient | None = None
+        if getattr(settings, "vlm_enabled", False):
+            try:
+                self.vlm = build_vlm_client(settings)
+            except Exception as exc:
+                log.warning("视觉模型客户端创建失败，本次只走 DOM 通道: %s", exc)
 
     async def run(
         self,
@@ -457,7 +507,15 @@ class ReActAgent:
         run_dir: Path,
         confirm: Callable[[str], Awaitable[bool]] | None = None,
         max_steps: int | None = None,
+        login_handoff: LoginHandoff | None = None,
     ) -> RunResult:
+        """跑一个任务。
+
+        `login_handoff`：遇到登录墙时把控制权交给人的回调。给了它，
+        Agent 才能"先登录、再找内容"；不给（评测、无人值守的服务），
+        遇到墙就走 `login_blocked_warning` 那套"体面停下"的逻辑 ——
+        **绝不**假装登录过了。
+        """
         max_steps = max_steps or self.settings.max_steps
         started = time.time()
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -492,6 +550,11 @@ class ReActAgent:
         # 所以这里留下完整序列 —— 存的是 16 位哈希，不是正文，代价可以忽略。
         fp_history: list[str] = []
         osc_notified_at = 0    # 上一次振荡警告是在第几步注入的（用于节流）
+        # 登录墙的状态机：
+        #   login_done         —— 人已经登录过一次了（不再重复打扰）
+        #   login_notified_at  —— 上一次"没人能登录"的提示是第几步（用于节流）
+        login_done = False
+        login_notified_at = 0
 
         for step in range(1, max_steps + 1):
             # 本步有没有因为"振荡"给过提醒（写进轨迹，供事后核对）。
@@ -505,8 +568,68 @@ class ReActAgent:
                 step=step,
                 run_dir=run_dir,
                 prefer_vision=prefer_vision,
+                vlm=self.vlm,
             )
             prefer_vision = False
+
+            # ---------- 登录墙：先登录，再找内容 ----------
+            # 放在所有循环判据之前，因为它是**更具体**的解释：
+            # "你在登录页和内容页之间来回"这件事，与其让振荡检测笼统地说
+            # "你在绕圈子"，不如直接说"你被登录墙挡住了、顺序还反了"。
+            if state.is_login_wall:
+                if not login_done and login_handoff is not None:
+                    resumed = False
+                    try:
+                        resumed = await login_handoff(state.url, state.login_reason)
+                    except Exception as exc:
+                        # 交接失败不能把任务带崩：视作"没登录成"，走下面的提示分支。
+                        log.warning("登录交接失败，按未登录处理: %s", exc)
+                    if resumed:
+                        login_done = True
+                        # 登录之后世界变了：清掉所有"基于旧页面"的判据状态。
+                        # 不清的后果很具体 —— 登录页↔内容页那几个旧指纹还在
+                        # fp_history 里，登录后第一步就会被判成"又在振荡"，
+                        # 把刚刚成功的登录又带偏回去。
+                        fp_history.clear()
+                        prev_fp = ""
+                        stall_count = 0
+                        closing, closing_steps = False, 0
+                        consecutive_failures = 0
+                        sig_trail.clear()
+                        last_action = None
+                        # 回到任务入口：登录之前打开的往往是登录页，
+                        # 只有重新打开起始网址，内容才真的在。
+                        await session.execute(
+                            Action(action="goto", url=start_url), confirm=confirm
+                        )
+                        records.append(
+                            StepRecord(
+                                step=step, action=None, raw_action="登录交接",
+                                ok=True,
+                                message=f"已完成登录，回到任务入口 {start_url}",
+                                url_after=session.page.url if session.page else "",
+                                screenshot_path=state.screenshot_path,
+                                # 登录前那一帧的指纹（下面马上会清空历史）：
+                                # 留着它，复盘时才能看出"登录前后页面确实变了"。
+                                page_fp=page_fingerprint(state),
+                                stall_count=0, osc_pages=osc_warned,
+                            )
+                        )
+                        if self.on_step:
+                            self.on_step(step, None, True, "已完成登录，回到任务入口")
+                        history.append(
+                            f"第 {step} 步: 登录已完成，已重新打开任务入口 {start_url}。"
+                            f"现在按任务要求去找内容 —— 顺序是**先登录后找内容**，不要反过来。"
+                        )
+                        history = history[-12:]
+                        continue
+
+                # 没有交接通道，或交接没成功 → 明确告诉它"停下来"，并节流。
+                # `login_notified_at == 0` 这一支是**第一次遇到**：
+                # 节流不能把第一次提醒也节掉（否则前面几步它还在盲目横跳）。
+                if login_notified_at == 0 or step - login_notified_at >= LOGIN_NOTIFY_EVERY:
+                    login_notified_at = step
+                    history.append(login_blocked_warning(state.login_reason))
 
             # ---------- 停滞检测：这一步到底有没有得到新信息？----------
             # 放在"想（Reason）"**之前**，是为了让下面的警告进到本轮 prompt 里 ——
@@ -554,7 +677,9 @@ class ReActAgent:
             # 口径与出处见上方 OSCILLATION_* 常量区），拿它拦动作会连
             # t04 的正常往返一起打掉。
             # 引擎在这里的角色是"把模型看不到的事实告诉它"，不是替它做决定。
-            if not closing and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
+            # 登录墙上不再发振荡警告：上面已经给过**更具体**的解释了，
+            # 同时喂两句会互相打架（一句说"换做法"，一句说"绕圈子"）。
+            if not closing and not state.is_login_wall and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
                 osc_pages = oscillation_pages(fp_history)
                 if osc_pages is not None:
                     osc_notified_at = step
@@ -594,6 +719,9 @@ class ReActAgent:
                         step=step,
                         action=None,
                         raw_action="(格式错误)",
+                        # 原始输出留档：复盘时要回答"它到底错成什么样"，
+                        # 而 `raw_action` 那个占位标签回答不了这个问题。
+                        raw_output=(raw or "")[:300],
                         ok=False,
                         message=f"模型输出不是合法 JSON：{parse_err}",
                         url_after=state.url,

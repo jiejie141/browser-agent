@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, ValidationError
@@ -147,6 +148,14 @@ class PageState(BaseModel):
     elements: list[Element] = Field(default_factory=list)
     body_text: str = ""
     screenshot_path: str = ""
+    # 这一帧是不是一堵**登录墙**，以及判定的理由。
+    #
+    # 为什么这个判断要落在感知层：它是**页面的属性**，跟模型在想什么无关。
+    # 放在 prompt 里让模型自己判断是行不通的 —— 它看到的只是"页面上有些字"，
+    # 认不出"我被挡住了"，于是继续在登录页和内容页之间横跳（见 perception
+    # 里 detect_login_wall 的说明）。
+    is_login_wall: bool = False
+    login_reason: str = ""
 
     def render_for_prompt(self, max_body_chars: int = 3000) -> str:
         """渲染成给模型看的纯文本。控制长度就是控制成本。
@@ -188,6 +197,21 @@ class PageState(BaseModel):
             lines.append("  (这一帧没有解析到可交互元素——可能是页面还在加载，")
             lines.append("   或者内容在 Canvas / iframe 里，可以试试 scroll 或 screenshot)")
 
+        if self.is_login_wall:
+            # 把"你被挡住了"这件模型自己看不出来的事说清楚。
+            # 只说"这是登录页"不够 —— 还必须告诉它**来回切换没有用**，
+            # 否则它下一秒就又去点内容页了（这就是用户看到的横跳）。
+            lines += [
+                "",
+                f"⚠ 当前页面是**登录墙**（判定依据：{self.login_reason}）。",
+                "你在登录页和内容页之间来回切换**不会带来任何新信息**，"
+                "因为内容必须先登录才能看到。",
+                "请按下面的顺序来：先完成登录（如果有登录入口且你被允许登录），"
+                "**登录成功之后**再去找内容 —— 不要反过来。",
+                "如果无法登录，就直接 finish 说明「需要登录，无法完成」，"
+                "这类结论免检 evidence。",
+            ]
+
         body = (self.body_text or "").strip()
         if body:
             lines += ["", "页面正文摘要:", _elide_ordered(body, max_body_chars)]
@@ -207,6 +231,17 @@ class StepRecord(BaseModel):
     # ValidationError —— 那等于"为了记录一个格式错误，先让程序崩掉"。
     action: Action | None = None
     raw_action: str = ""
+    # 这一步模型**原始吐出来的文本**。只在"解析失败"时留档，正常步骤留空。
+    #
+    # 为什么需要它：`raw_action` 只存了一个占位标签 `"(格式错误)"`，
+    # 于是复盘时能看见"这一步格式错了"，却**看不见它到底错成什么样** ——
+    # 排障时最想知道的那件事恰恰被丢掉了（README 第八节 8.14.4 记为观测缺口）。
+    # 有了原文才能回答：是模型包了代码块？把 ref 写成了 dy=500？
+    # 还是干脆回了一段自然语言？
+    #
+    # 正常步骤刻意留空：每一步都存原文会让 trace 体积翻好几倍，
+    # 而那些步骤的信息已经在 `action` 里了，存两遍没有收益。
+    raw_output: str = ""
     ok: bool = False
     message: str = ""
     url_after: str = ""
@@ -250,6 +285,95 @@ class StepOutcome(BaseModel):
     vision_hint: bool = False  # True 表示建议下一帧走视觉通道
 
 
+# 模型写"没有 ref"时用过的写法。它们的意思都是"这个字段为空"，没有歧义，
+# 应该被接受而不是当成格式错误。
+#
+# 实测轨迹里出现过 `"ref": "None"`（模型想表达"这一步不需要元素编号"），
+# 旧代码直接交给 pydantic，得到 `ValidationError` → 整步作废。
+# 明明是个无歧义的空值，却要把一步烧掉，这是**解析层的过严**，不是模型犯错。
+_NONE_WORDS = {"", "none", "null", "nil", "n/a", "nan", "-", "无", "空"}
+
+# `"ref": "dy=500"` 这类：**字段写串了**。
+# 与"写错类型"的区别很重要 —— 写错类型（`"ref": "abc"`）是打字问题，
+# 写串字段是**语义**问题，需要不同的报错才能教会模型。
+_MISFIELD_RE = re.compile(r"^\s*(dy|dx|ref|url|key|text|answer|action)\s*=", re.IGNORECASE)
+
+
+def _coerce_int(value: Any, name: str) -> tuple[int | None, str]:
+    """把模型写歪的数字字段掰正。返回 `(值, 错误信息)`。
+
+    ## 为什么只"掰正"一部分，剩下的要如实报错
+
+    ⚠️ 这里有一条很清楚的分界线，是**实测之后划的**（README 第八节 8.13）：
+
+    - **无歧义的** → 直接接受：`"12"` → `12`；`"None"` / `""` / `"null"` → `None`。
+      这些写法只有一个合理解释，替模型纠正它不等于替它做决定。
+    - **有歧义的** → 绝不猜，报错并讲清正确写法：`"ref": "dy=500"` 看起来
+      "显然"是想滚 500 像素，但把它翻译成 `scroll(dy=500)` 就是**引擎替模型
+      补了一个动作参数** —— 而"这一步到底要不要滚、滚多少"正是该由模型决定的事。
+      猜对了是侥幸，猜错了会执行一个模型根本没要求的动作。**不猜，但报错要说清楚。**
+
+    最贵的一次教训：这条错误连续出现在 4 步里，触发「模型连续输出非法格式」
+    提前中止，**21 步全部作废**。所以报错必须**自解释** —— 把正确写法直接写出来，
+    小模型读到就能改，而不是只能再试一次同样的东西。
+    """
+    if value is None:
+        return None, ""
+    if isinstance(value, bool):
+        return None, f"{name}={value!r} 是布尔值，这里需要整数"
+    if isinstance(value, int):
+        return value, ""
+    if isinstance(value, float):
+        return (int(value), "") if float(value).is_integer() else (
+            None, f"{name}={value!r} 不是整数"
+        )
+    if isinstance(value, str):
+        s = value.strip()
+        if s.lower() in _NONE_WORDS:
+            return None, ""
+        if _MISFIELD_RE.match(s):
+            if name == "ref":
+                return None, (
+                    f"ref={s!r} 是**字段写串了**：把别的动作的参数写进了 ref。"
+                    f"scroll 不用 ref，滚动距离要写成 "
+                    f'{{"action": "scroll", "dy": 500}}；'
+                    f"click/type 的 ref 必须是元素清单里的整数编号。"
+                )
+            return None, (
+                f"dy={s!r} 是**字段写串了**：dy 只接受一个整数（正数向下、负数向上），"
+                f'正确写法是 {{"action": "scroll", "dy": 500}}。'
+            )
+        try:
+            return int(s), ""
+        except ValueError:
+            pass
+        try:
+            f = float(s)
+        except ValueError:
+            return None, (
+                f"{name}={value!r} 不是整数：元素编号必须是清单里的数字，"
+                f"不需要带单位或说明文字"
+            )
+        return (int(f), "") if f.is_integer() else (None, f"{name}={value!r} 不是整数")
+
+    return None, f"{name} 的类型 {type(value).__name__} 无法识别"
+
+
+def _normalize_action_fields(data: Any) -> tuple[Any, str]:
+    """对 `ref` / `dy` 两个数字字段做容错归一化。只动这两个字段。"""
+    if not isinstance(data, dict):
+        return data, ""
+    out = dict(data)
+    for name in ("ref", "dy"):
+        if name not in out:
+            continue
+        value, err = _coerce_int(out[name], name)
+        if err:
+            return out, err
+        out[name] = value
+    return out, ""
+
+
 def parse_action(raw: str) -> tuple[Action | None, str]:
     """把模型返回的文本解析成 Action。
 
@@ -280,7 +404,16 @@ def parse_action(raw: str) -> tuple[Action | None, str]:
     except json.JSONDecodeError as exc:
         return None, f"JSON 解析失败({exc})，原始内容: {candidate[:200]}"
 
+    data, norm_err = _normalize_action_fields(data)
+    if norm_err:
+        # 原始输出要带出去：报错最终会进模型的下一轮 prompt，
+        # 它得先看见自己刚吐了什么，才知道该改哪儿。
+        return None, f"{norm_err}（模型原始输出: {candidate[:160]}）"
+
     try:
         return Action(**data), ""
     except ValidationError as exc:
-        return None, f"动作字段不合法: {exc.errors()[:3]}"
+        return None, (
+            f"动作字段不合法: {exc.errors()[:3]}"
+            f"（模型原始输出: {candidate[:160]}）"
+        )

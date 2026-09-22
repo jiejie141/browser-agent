@@ -213,6 +213,37 @@ def build_client(settings: Settings) -> LLMClient:
     )
 
 
+def build_vlm_client(settings: Settings) -> LLMClient | None:
+    """按 VLM_* 配置造一个视觉模型客户端；没配就返回 None。
+
+    ## 为什么这个函数非有不可（一个真实的"接了但没通电"的 bug）
+
+    感知层 `perceive()` 有 `vlm` 这个参数，视觉分支的判定是
+    `if settings.vlm_enabled and vlm is not None`。
+    而**两个引擎调用 `perceive()` 时都没传 `vlm`** —— 于是这个条件永远为假：
+
+    - 截图照常拍（浪费一次 I/O）；
+    - 但"让视觉模型描述屏幕上有什么"这一步**从来没执行过**；
+    - 表现是：配好了 VLM key 也不会有任何区别，而日志里没有任何异常
+      —— 这是最难发现的那一类缺陷：**代码在跑，功能没接上**。
+
+    所以在引擎侧统一造一个客户端并传进去，让判定的第二个条件真正可能成立。
+
+    `VLM_BASE_URL` 留空时回落到主模型的端点：多数中转服务（本项目现在用的
+    基元律动就是）文本和视觉走同一个 base_url，让用户为每个通道再抄一遍地址
+    是没必要的负担；而空字符串交给 SDK 会被解释成官方 api.openai.com，
+    那才真的是配错。
+    """
+    if not (getattr(settings, "vlm_api_key", "") and getattr(settings, "vlm_model", "")):
+        return None
+    return LLMClient(
+        api_key=settings.vlm_api_key,
+        base_url=(settings.vlm_base_url or settings.llm_base_url),
+        model=settings.vlm_model,
+        label="vlm",
+    )
+
+
 class MockLLMClient(LLMClient):
     """离线替身：按剧本返回动作，不联网。
 
@@ -260,4 +291,8 @@ class MockLLMClient(LLMClient):
 
     def chat_vision(self, prompt, image_path, *, max_tokens=512) -> str:
         self.usage.add(Usage(prompt_tokens=1200, completion_tokens=80, calls=1))
+        # 必须返回字符串：调用方 `_describe_with_vision` 会把它直接拼进正文
+        # （`"[视觉通道补充]" + hint`）。返回 None 时拼接会抛 TypeError，
+        # 而它发生在感知层内部 —— 一个"替身"的实现细节会把整帧感知打挂。
+        return ""
         return "（MOCK）这是一个用于离线验证的假视觉描述。"

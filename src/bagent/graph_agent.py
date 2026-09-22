@@ -51,14 +51,17 @@ from .agent import (
     LOOP_STOP_AT,
     LOOP_WARN_AT,
     MAX_CONSECUTIVE_FAILURES,
+    LOGIN_NOTIFY_EVERY,
     OSCILLATION_NOTIFY_EVERY,
     OSCILLATION_WINDOW,
     STALL_STOP_AT,
     STALL_WARN_AT,
     SYSTEM_PROMPT,
     RunResult,
+    LoginHandoff,
     StepCallback,
     _action_signature,
+    login_blocked_warning,
     loop_counts,
     oscillation_pages,
     oscillation_warning,
@@ -68,7 +71,7 @@ from .agent import (
 from .browser import BrowserSession
 from .config import Settings
 from .grounding import MAX_GROUNDING_RETRIES, check_grounding
-from .llm import LLMClient, LLMError, build_client
+from .llm import LLMClient, LLMError, build_client, build_vlm_client
 from .models import Action, StepRecord, Usage, parse_action
 from .perception import perceive
 
@@ -170,6 +173,17 @@ class AgentState(TypedDict, total=False):
     grounded: bool
     grounding_note: str
     grounding_retries: int
+    # 登录墙：与手写引擎同一套语义（先登录，再找内容）。
+    #   login_done        —— 人已经登录过一次（不再重复打扰）
+    #   login_notified_at —— 上一次"没人能登录"的提示是第几步（节流用）
+    #   just_logged_in    —— 本节点刚完成登录交接，需要**重新感知**一次
+    login_done: bool
+    login_notified_at: int
+    just_logged_in: bool
+    # reason 节点解析失败时，模型**原始输出**的文本。必须声明才能在节点间
+    # 传到 act（未声明的键 LangGraph 会直接丢掉 —— 上面已经踩过两次）。
+    # act 节点靠它把原文写进 StepRecord.raw_output。
+    raw_output: str
 
 
 def _note(state: AgentState, text: str) -> list[str]:
@@ -195,6 +209,18 @@ def route_after_reason(
     if state.get("error"):
         return "end"
     return "act"
+
+
+def route_after_perceive(state: AgentState) -> Literal["perceive", "reason"]:
+    """perceive 节点之后要不要**再看一眼页面**。
+
+    只有一种情况需要：刚才完成了登录交接。登录改变的是"能看到什么"，
+    不重新感知就继续推理，模型手上的还是登录前那一帧 ——
+    那正是"登录了却还在找登录前的内容"的来源。
+    """
+    if state.get("just_logged_in"):
+        return "perceive"
+    return "reason"
 
 
 def route_after_act(state: AgentState) -> Literal["perceive", "end"]:
@@ -226,6 +252,15 @@ class LangGraphReActAgent:
         self.settings = settings
         self.llm = llm or build_client(settings)
         self.on_step = on_step
+        self.login_handoff: LoginHandoff | None = None
+        # 与手写引擎一致：自己造视觉客户端并传给 perceive，
+        # 否则 `vlm is not None` 恒为假，视觉描述这条降级路径等于没接。
+        self.vlm: LLMClient | None = None
+        if getattr(settings, "vlm_enabled", False):
+            try:
+                self.vlm = build_vlm_client(settings)
+            except Exception as exc:
+                log.warning("视觉模型客户端创建失败，本次只走 DOM 通道: %s", exc)
         self._graph = self._build_graph()
 
     # ------------------------------------------------------------------
@@ -239,7 +274,12 @@ class LangGraphReActAgent:
         g.add_node("act", self._node_act)
 
         g.set_entry_point("perceive")
-        g.add_edge("perceive", "reason")
+        # 登录交接之后必须**重新感知**：登录前的那一帧是登录页，
+        # 直接拿它去问模型"下一步做什么"，等于让它对着登录页继续规划。
+        g.add_conditional_edges(
+            "perceive", route_after_perceive,
+            {"perceive": "perceive", "reason": "reason"},
+        )
         g.add_conditional_edges(
             "reason", route_after_reason, {"act": "act", "perceive": "perceive", "end": END}
         )
@@ -260,6 +300,7 @@ class LangGraphReActAgent:
             step=step,
             run_dir=self._run_dir,
             prefer_vision=state.get("prefer_vision", False),
+            vlm=self.vlm,
         )
 
         # ---------- 停滞检测：动作各异，但页面一字未变 ----------
@@ -282,6 +323,53 @@ class LangGraphReActAgent:
         history = list(state.get("history") or [])
         closing = state.get("closing", False)
         closing_steps = state.get("closing_steps", 0)
+
+        # ---------- 登录墙：先登录，再找内容（与手写引擎同一套语义）----------
+        if st.is_login_wall:
+            if not state.get("login_done") and self.login_handoff is not None:
+                resumed = False
+                try:
+                    resumed = await self.login_handoff(st.url, st.login_reason)
+                except Exception as exc:
+                    log.warning("登录交接失败，按未登录处理: %s", exc)
+                if resumed:
+                    await session.execute(
+                        Action(action="goto", url=state.get("start_url", ""))
+                    )
+                    rec = StepRecord(
+                        step=step, action=None, raw_action="登录交接", ok=True,
+                        message=f"已完成登录，回到任务入口 {state.get('start_url', '')}",
+                        url_after=session.page.url if session.page else "",
+                    ).model_dump()
+                    return {
+                        "login_done": True,
+                        "just_logged_in": True,
+                        # 清空所有基于"登录前页面"的判据状态，
+                        # 否则刚登录就被旧指纹判成"又在振荡"。
+                        "fp_history": [],
+                        "prev_fp": "",
+                        "stall_count": 0,
+                        "closing": False,
+                        "closing_steps": 0,
+                        "consecutive_failures": 0,
+                        "sig_trail": [],
+                        "records": list(state.get("records") or []) + [rec],
+                        "history": _note(
+                            state,
+                            f"第 {step} 步: 登录已完成，已重新打开任务入口。"
+                            f"现在去找内容 —— 顺序是**先登录后找内容**，不要反过来。",
+                        ),
+                    }
+
+            notified_at = state.get("login_notified_at", 0)
+            # 与手写引擎一致：`0` 表示"还没提醒过"，第一次必须提醒，不能节流掉。
+            if notified_at == 0 or step - notified_at >= LOGIN_NOTIFY_EVERY:
+                history.append(login_blocked_warning(st.login_reason))
+                out_login_at = step
+            else:
+                out_login_at = state.get("login_notified_at", 0)
+        else:
+            out_login_at = state.get("login_notified_at", 0)
 
         if stall_count >= STALL_STOP_AT:
             if not closing:
@@ -318,7 +406,8 @@ class LangGraphReActAgent:
         osc_notified_at = state.get("osc_notified_at", 0)
         # 本步有没有因"振荡"提醒过（每步重置，写进 trace 供事后核对）
         osc_warned = 0
-        if not closing and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
+        # 登录墙上不发振荡警告：上面已经给过更具体的解释，同时喂两句会互相打架。
+        if not closing and not st.is_login_wall and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
             osc_pages = oscillation_pages(fp_history)
             if osc_pages is not None:
                 osc_notified_at = step
@@ -337,6 +426,10 @@ class LangGraphReActAgent:
             "fp_history": fp_history[-24:],
             "osc_notified_at": osc_notified_at,
             "osc_pages": osc_warned,
+            "login_notified_at": out_login_at,
+            # 正常路径一定要把它写回 False：否则下次路由还会再"重新感知"一次，
+            # 形成 perceive → perceive 的自环。
+            "just_logged_in": False,
         }
         if len(history) != len(state.get("history") or []):
             out["history"] = history[-12:]
@@ -368,12 +461,16 @@ class LangGraphReActAgent:
                     f"请只输出合法 JSON",
                 ),
                 "consecutive_failures": n,
+                # 交给 act 节点写进 trace：复盘时要能看见"错成什么样"，
+                # 而不只是"这一步错了"。
+                "raw_output": (raw or "")[:300],
             }
             if n >= MAX_CONSECUTIVE_FAILURES:
                 out["error"] = f"模型连续输出非法格式: {parse_err}"
             return out
 
-        return {"action": action}
+        # 解析成功 → 把上一步可能留下的原文清掉，避免它被写进下一条记录
+        return {"action": action, "raw_output": ""}
 
     async def _node_act(self, state: AgentState) -> dict:
         session: BrowserSession = self._session
@@ -391,10 +488,18 @@ class LangGraphReActAgent:
                     step=step,
                     action=None,
                     raw_action="(格式错误)",
+                    # 与手写引擎一致：解析失败时把原文留档，否则复盘只看得见
+                    # "这一步错了"、看不见"错成什么样"。
+                    raw_output=(state.get("raw_output") or "")[:300],
                     ok=False,
                     message="模型输出不是合法 JSON",
                     url_after=(state.get("page_state").url
                                if state.get("page_state") else ""),
+                    # 与手写引擎对齐的观测字段：停滞/振荡的判据输入是页面序列，
+                    # 缺了它们就没法从 trace 直接回答"当时页面变没变"。
+                    page_fp=state.get("prev_fp", ""),
+                    stall_count=state.get("stall_count", 0),
+                    osc_pages=state.get("osc_pages", 0),
                 ).model_dump()
             )
             if self.on_step:
@@ -590,7 +695,11 @@ class LangGraphReActAgent:
         run_dir: Path,
         confirm: Callable[[str], Awaitable[bool]] | None = None,
         max_steps: int | None = None,
+        login_handoff: LoginHandoff | None = None,
     ) -> RunResult:
+        # 登录交接是**每次运行**的入参（不是构造参数）：谁能登录、怎么登录
+        # 由调用方决定，引擎只认"返回 True 表示已登录"这个契约。
+        self.login_handoff = login_handoff
         max_steps = max_steps or self.settings.max_steps
         started = time.time()
         run_dir.mkdir(parents=True, exist_ok=True)

@@ -24,6 +24,7 @@ from .agent import new_run_dir
 from .browser import open_browser
 from .config import get_settings
 from .graph_agent import build_agent
+from .agent import LoginHandoff
 from .llm import LLMError, MockLLMClient, build_client
 from .models import Action
 
@@ -99,6 +100,40 @@ def _print_summary(result) -> None:
     console.print(Panel(table, title="[bold]本次运行[/bold]", border_style="blue"))
 
 
+def build_login_handoff(settings) -> "LoginHandoff | None":
+    """造一个"人在终端里配合登录"的交接回调。
+
+    做不到的时候**必须返回 None，而不是返回一个假装成功的东西**：
+    无头模式下根本没有窗口可看，让人登录是无稽之谈；
+    非交互环境（CI、管道）里也没有人能按回车。
+    返回 None 之后引擎会走"体面停下"那条路（见 agent.login_blocked_warning），
+    而不是卡在那里干等。
+    """
+    if getattr(settings, "headless", True):
+        return None
+    if not sys.stdin or not sys.stdin.isatty():
+        return None
+
+    async def handoff(url: str, reason: str) -> bool:
+        console.print(
+            Panel(
+                f"[bold]检测到登录墙[/bold]：{reason}\n"
+                f"当前页: {url}\n\n"
+                f"请在刚才那个浏览器窗口里完成登录，然后回到这里按回车继续。\n"
+                f"[dim]（顺序是：先登录 → 再找内容。引擎会在登录后自动重新打开任务入口）[/dim]",
+                title="[yellow]需要你登录[/yellow]",
+                border_style="yellow",
+            )
+        )
+        try:
+            await asyncio.to_thread(input, "登录完成后按回车继续（Ctrl+C 放弃）: ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return True
+
+    return handoff
+
+
 async def run_one(task: str, url: str, max_steps: int | None, settings, mock: bool = False) -> int:
     run_dir = new_run_dir(settings, tag="task")
     engine = (getattr(settings, "engine", "handwritten") or "handwritten").lower()
@@ -110,6 +145,13 @@ async def run_one(task: str, url: str, max_steps: int | None, settings, mock: bo
 
     llm = MockLLMClient() if mock else build_client(settings)
     agent = build_agent(settings, llm=llm, on_step=_print_step)
+    # 无头模式下这里会是 None，引擎据此走"体面停下"那条路而不是干等。
+    login_handoff = None if mock else build_login_handoff(settings)
+    if login_handoff is None and not mock and getattr(settings, "headless", True):
+        console.print(
+            "[dim]提示：当前是无头模式，遇到需要登录的站点时无法手动登录，"
+            "Agent 会直接说明「需要登录，无法完成」。要手动登录请加 --headful。[/dim]"
+        )
 
     async with open_browser(settings, run_dir) as session:
         result = await agent.run(
@@ -119,6 +161,7 @@ async def run_one(task: str, url: str, max_steps: int | None, settings, mock: bo
             run_dir=run_dir,
             confirm=_confirm_interactive,
             max_steps=max_steps,
+            login_handoff=login_handoff,
         )
 
     _print_summary(result)
@@ -316,6 +359,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.task_file:
             tasks = load_task_file(Path(args.task_file))
             if args.only:
+                # 越界的 `--only` 原来是 IndexError 崩在终端里。
+                # 对使用者来说那句堆栈毫无信息量 —— 他只想知道"我该填几"。
+                if args.only < 1 or args.only > len(tasks):
+                    console.print(
+                        f"[red]--only {args.only} 越界：任务集里只有 {len(tasks)} 条"
+                        f"（合法取值 1~{len(tasks)}）[/red]"
+                    )
+                    return 2
                 tasks = [tasks[args.only - 1]]
             if not tasks:
                 console.print("[red]任务文件里没有任务[/red]")

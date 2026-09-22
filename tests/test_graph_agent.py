@@ -467,7 +467,7 @@ def test_langgraph_perceive_node_wires_the_stall_detector(monkeypatch):
 
     frozen = PageState(url="https://x/", title="T", body_text="一字未变的正文")
 
-    async def fake_perceive(page, settings, *, step, run_dir, prefer_vision=False):
+    async def fake_perceive(page, settings, *, step, run_dir, prefer_vision=False, vlm=None):
         return frozen
 
     monkeypatch.setattr(g, "perceive", fake_perceive)
@@ -697,7 +697,7 @@ def test_langgraph_perceive_node_wires_the_oscillation_detector(monkeypatch):
     seq = ["https://x/a", "https://x/b"] * 4
     box = {"n": 0}
 
-    async def fake_perceive(page, settings, *, step, run_dir, prefer_vision=False):
+    async def fake_perceive(page, settings, *, step, run_dir, prefer_vision=False, vlm=None):
         url = seq[min(box["n"], len(seq) - 1)]
         box["n"] += 1
         return pages[url]

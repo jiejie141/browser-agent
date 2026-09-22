@@ -157,6 +157,11 @@ textarea{resize:vertical; min-height:76px; line-height:1.55}
 .badge.bad{background:rgba(248,113,113,.14); color:var(--red); border:1px solid rgba(248,113,113,.35)}
 .badge.run{background:rgba(251,191,36,.14); color:var(--amber); border:1px solid rgba(251,191,36,.35)}
 .badge.idle{background:rgba(147,161,184,.12); color:var(--fg-2); border:1px solid var(--line-2)}
+.badge.wait{background:rgba(96,165,250,.14); color:var(--blue); border:1px solid rgba(96,165,250,.35)}
+.loginbox{display:none; border:1px solid rgba(96,165,250,.35); background:rgba(96,165,250,.08);
+  border-radius:9px; padding:12px 14px; margin-bottom:14px; font-size:13px; line-height:1.7}
+.loginbox .row{display:flex; gap:10px; margin-top:10px; flex-wrap:wrap}
+.loginbox .hint{color:var(--fg-2)}
 .answer{
   background:#0a0f17; border:1px solid var(--line-2); border-left:3px solid var(--cyan);
   border-radius:9px; padding:13px 15px; font-size:13.5px; line-height:1.75;
@@ -296,6 +301,14 @@ code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); paddi
         <span class="badge idle" id="vb">—</span>
         <span class="pill" id="vtid" style="display:none"></span>
       </div>
+      <div class="loginbox" id="loginbox">
+        <div><b>这个站点需要登录</b> —— 顺序是「先登录，再找内容」。</div>
+        <div class="hint" id="loginhint"></div>
+        <div class="row">
+          <button class="btn btn-primary" id="logindone">我已完成登录，继续</button>
+          <button class="btn" id="logincancel">放弃登录</button>
+        </div>
+      </div>
       <div class="answer" id="ans" style="display:none"></div>
       <div class="metrics" id="mets" style="display:none"></div>
       <div id="err"></div>
@@ -388,6 +401,26 @@ $('#go').onclick = async () => {
   }
 };
 
+/* ---- 登录交接：人是唯一有凭据的一方，引擎只负责等和继续 ---- */
+$('#logindone').onclick = async () => {
+  if(!cur) return;
+  $('#logindone').disabled = true;
+  try{
+    await api('/tasks/' + cur + '/login-done', {method:'POST'});
+    $('#loginbox').style.display = 'none';
+  }catch(e){ alert('通知失败：' + e.message); }
+  finally{ $('#logindone').disabled = false; }
+};
+$('#logincancel').onclick = async () => {
+  if(!cur) return;
+  $('#logincancel').disabled = true;
+  try{
+    await api('/tasks/' + cur + '/login-cancel', {method:'POST'});
+    $('#loginbox').style.display = 'none';
+  }catch(e){ alert('通知失败：' + e.message); }
+  finally{ $('#logincancel').disabled = false; }
+};
+
 /* ---- 轮询：任务是后台异步跑的，只有靠自己拉 ----
    pending/running 每 1.2s 拉一次；终态就停，避免无意义的请求。 */
 function poll(){
@@ -402,11 +435,21 @@ function poll(){
   }, 1200);
 }
 
-const BADGE = {pending:['run','排队中'], running:['run','执行中'], succeeded:['ok','成功'], failed:['bad','失败']};
-const LABEL = {pending:'排队中', running:'执行中', succeeded:'成功', failed:'失败'};
+const BADGE = {pending:['run','排队中'], running:['run','执行中'], succeeded:['ok','成功'], failed:['bad','失败'],
+  waiting_login:['wait','等待登录']};
+const LABEL = {pending:'排队中', running:'执行中', succeeded:'成功', failed:'失败', waiting_login:'等待登录'};
 
 function paint(t){
   const [cls, txt] = BADGE[t.status] || ['idle', t.status];
+  // 等待登录时必须把"该你干活了"说清楚：只转圈的话，
+  // 使用者不知道是自己该登录，只会以为卡住了。
+  const lb = $('#loginbox');
+  if(t.status === 'waiting_login'){
+    lb.style.display = '';
+    $('#loginhint').textContent = t.login_hint || '请在浏览器窗口里完成登录。';
+  } else {
+    lb.style.display = 'none';
+  }
   const vb = $('#vb');
   vb.className = 'badge ' + cls;
   vb.innerHTML = (t.status === 'running' || t.status === 'pending' ? '<span class="spin"></span> ' : '') + txt;

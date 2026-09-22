@@ -177,6 +177,16 @@ class Settings:
         default_factory=lambda: _get_float("TEARDOWN_TIMEOUT_SECONDS", 8.0)
     )
 
+    # 遇到登录墙时，等人登录的最长时间（秒）。
+    #
+    # 为什么必须有个上限：登录交接是**阻塞**的 —— 引擎在等人的时候不会往下走。
+    # 没有人来点"登录完成"，任务就会永远停在 waiting_login，
+    # 控制台一直转圈，而它其实只是在等人。超时之后按"没登录成"处理，
+    # 引擎照常给出「需要登录，无法完成」的结论。
+    login_wait_seconds: float = field(
+        default_factory=lambda: _get_float("LOGIN_WAIT_SECONDS", 300.0)
+    )
+
     # ---- Agent 引擎 ----
     # handwritten：agent.py 里的手写 ReAct 循环（默认，零额外依赖）
     # langgraph：graph_agent.py 里的 LangGraph StateGraph 实现

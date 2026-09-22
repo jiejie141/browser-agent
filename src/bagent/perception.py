@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from playwright.async_api import Page
@@ -272,6 +273,82 @@ async def extract_elements(page: Page) -> list[Element]:
     return elements
 
 
+# ---------------------------------------------------------------------------
+# 登录墙识别
+#
+# ## 为什么要单独识别它（这是用户直接反馈的失效形态）
+#
+# 遇到需要登录的站点时，Agent 的典型表现是**在登录页和内容页之间反复横跳**：
+# 点进内容 → 被弹回登录页 → 再点 → 再被弹回。每一步都是"成功"的、页面也确实
+# 在变，所以：动作指纹（动作在交替）抓不到、停滞检测（页面在变）抓不到、
+# 振荡检测只能给一句笼统的"你在绕圈子" —— 而模型并不知道**该登录**这件事，
+# 于是它继续换着花样点，直到步数耗尽。
+#
+# 缺的不是"再聪明点的提示词"，是**一个模型自己看不出来的事实**：
+# "你现在站在一堵登录墙前面"。识别出来之后，才有"先登录、再找内容"可言。
+# ---------------------------------------------------------------------------
+
+# 网址里的登录信号。注意是**路径**级别的词，不是域名里碰巧出现的字母。
+_LOGIN_URL_RE = re.compile(
+    r"(?:^|[/&?])(login|signin|sign[-_]?in|log[-_]?in|passport|auth|authenticate"
+    r"|sso|cas|oauth2?|session/new|account/login|uaa|validate)",
+    re.IGNORECASE,
+)
+
+# 页面文案里的登录信号（中英文都覆盖：本项目跑的站点国内外都有）
+_LOGIN_TEXT_MARKERS = (
+    "登录", "登陆", "请先登录", "登录后查看", "登录以继续", "需要登录", "请登录",
+    "注册", "验证码", "短信验证", "扫码登录", "密码登录", "账号登录", "立即登录",
+    "sign in", "log in", "please log in", "sign in to continue", "login required",
+)
+
+# 只靠文案判定时的**强信号**子集：普通的导航里也常有"登录"两个字，
+# 光凭它就把整页判成登录墙会误伤内容页（"登录后查看"这种才是真的被挡住）。
+_LOGIN_STRONG_MARKERS = (
+    "请先登录", "登录后查看", "登录以继续", "需要登录", "请登录",
+    "please log in", "sign in to continue", "login required",
+)
+
+# 正文短到这个长度 + 命中强信号，基本可以断定"内容被墙挡住了"
+_WALL_BODY_CHARS = 1200
+
+
+def detect_login_wall(
+    url: str = "",
+    title: str = "",
+    body_text: str = "",
+    *,
+    has_password_field: bool = False,
+) -> tuple[bool, str]:
+    """判断当前这一帧是不是一堵**登录墙**。纯函数，可离线单测。
+
+    返回 `(是不是, 理由)`。三条判据，都要求**两个以上信号同时成立** ——
+    单一信号误伤太大（带"登录"入口的内容页到处都是，把它判成墙会让
+    Agent 在该回答的时候直接放弃）。
+
+    ⚠️ 刻意没有"看到密码框就判墙"这一条：很多正常页面的侧栏登录框
+    也带 password input，而内容其实是可读的。
+    """
+    u = (url or "").lower()
+    text = f"{title or ''}\n{body_text or ''}"
+    low = text.lower()
+
+    url_hit = bool(_LOGIN_URL_RE.search(u))
+    text_hit = any(m.lower() in low for m in _LOGIN_TEXT_MARKERS)
+    strong_hit = any(m.lower() in low for m in _LOGIN_STRONG_MARKERS)
+
+    if has_password_field and (url_hit or text_hit):
+        return True, "页面上有密码输入框，且网址或文案指向登录"
+    if url_hit and text_hit:
+        return True, "网址与页面文案都指向登录页"
+    if strong_hit and len(body_text or "") < _WALL_BODY_CHARS:
+        return True, "页面正文很短且明确提示需要登录（内容被登录墙挡住了）"
+    return False, ""
+
+
+_HAS_PASSWORD_JS = "() => document.querySelectorAll('input[type=password]').length > 0"
+
+
 async def extract_body_text(page: Page, max_chars: int = 4000) -> str:
     """读正文。优先主内容区，避免几千字的导航/页脚把正文淹掉。"""
     try:
@@ -310,12 +387,25 @@ async def perceive(
 
     body_text = await extract_body_text(page)
 
+    # 登录墙识别放在**元素抽取之后**：有没有密码框是一个更强的信号，
+    # 但它必须和网址/文案合起来看（单凭密码框会误伤带侧栏登录框的内容页）。
+    has_pwd = False
+    try:
+        has_pwd = bool(await page.evaluate(_HAS_PASSWORD_JS))
+    except Exception:  # 页面正在跳转时 evaluate 会失败，按"没有密码框"继续
+        has_pwd = False
+    is_wall, wall_reason = detect_login_wall(
+        url, title, body_text, has_password_field=has_pwd
+    )
+
     state = PageState(
         step=step,
         url=url,
         title=title,
         elements=elements,
         body_text=body_text,
+        is_login_wall=is_wall,
+        login_reason=wall_reason,
     )
 
     if need_vision:

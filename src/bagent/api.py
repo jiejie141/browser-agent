@@ -93,7 +93,12 @@ class TaskCreated(BaseModel):
 
 class TaskStatus(BaseModel):
     task_id: str
-    status: str  # pending / running / succeeded / failed
+    # pending / running / **waiting_login** / succeeded / failed
+    #
+    # `waiting_login` 是后加的一档：遇到登录墙时任务并没有在"跑"，
+    # 它在**等人登录**。用 running 表示它，控制台就只会转圈 ——
+    # 使用者看不出"该我干活了"，只能干等到超时。
+    status: str
     engine: str
     created_at: str
     finished_at: str | None = None
@@ -114,6 +119,9 @@ class TaskStatus(BaseModel):
     error: str = ""
     records: list[StepOut] = Field(default_factory=list)
     run_dir: str = ""
+    # 处于 waiting_login 时，告诉前端"要登录哪个站、怎么继续"。
+    # 没有这个字段，前端只能写一个死的提示文案，站点一换就对不上。
+    login_hint: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +249,12 @@ def create_task(req: TaskRequest, bg: BackgroundTasks) -> TaskCreated:
         "error": "",
         "records": [],
         "run_dir": "",
+        "login_hint": "",
+        # 登录交接用的事件。**必须在建任务时就造好**，不能等后台任务起来再造：
+        # 用户点"登录完成"可能比后台协程真正开始跑还早，那时事件还不存在，
+        # 这一次点击就被吞掉了 —— 使用者会以为点了没反应。
+        "_login_event": asyncio.Event(),
+        "_login_aborted": False,
     }
     bg.add_task(_run_task, tid, req, engine)
     _evict_old()
@@ -253,6 +267,44 @@ def get_task(task_id: str) -> TaskStatus:
     if t is None:
         raise HTTPException(404, f"任务不存在: {task_id}")
     return TaskStatus(**{k: v for k, v in t.items() if k in TaskStatus.model_fields})
+
+
+@app.post("/tasks/{task_id}/login-done", summary="人已登录，任务继续")
+def login_done(task_id: str) -> dict[str, Any]:
+    """通知后台任务：登录已完成，可以回到任务入口继续找内容了。
+
+    为什么要有这个端点，而不是让 Agent 自己想办法：
+    **引擎没有账号凭据，也不该保存用户密码**。登录只能由人来做，
+    引擎能做的是把门打开（阻塞等待）并被人叫醒（这个端点）。
+    """
+    t = _TASKS.get(task_id)
+    if t is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    if t.get("status") != "waiting_login":
+        raise HTTPException(409, f"任务当前不在等待登录（状态: {t.get('status')}）")
+    t["_login_event"].set()
+    t["status"] = "running"
+    t["login_hint"] = ""
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/tasks/{task_id}/login-cancel", summary="放弃登录，让 Agent 自己收尾")
+def login_cancel(task_id: str) -> dict[str, Any]:
+    """人在登录那一步放弃：让 Agent 走「需要登录，无法完成」的结论。
+
+    必须有这条路，否则"我登不进去"只能靠超时（默认 5 分钟）才知道 ——
+    而这件事人 5 秒就清楚了。
+    """
+    t = _TASKS.get(task_id)
+    if t is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    if t.get("status") != "waiting_login":
+        raise HTTPException(409, f"任务当前不在等待登录（状态: {t.get('status')}）")
+    t["_login_aborted"] = True
+    t["_login_event"].set()
+    t["status"] = "running"
+    t["login_hint"] = ""
+    return {"ok": True, "task_id": task_id}
 
 
 @app.get("/tasks", summary="列出最近任务")
@@ -313,6 +365,33 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             2,
         )
 
+    async def _login_handoff(url: str, reason: str) -> bool:
+        """把"登录"这件事交给人：改状态、等事件、被叫醒。
+
+        ⚠️ 等待是**有上限**的（st.login_wait_seconds，默认 300 秒）。
+        没人来点，任务不能永远挂在 waiting_login —— 那会让控制台一直转圈，
+        而它其实只是在等人。超时 = 没登录成，引擎照常给出结论。
+        """
+        ev = t["_login_event"]
+        ev.clear()
+        t["_login_aborted"] = False
+        t["status"] = "waiting_login"
+        t["login_hint"] = (
+            f"{reason}。请在浏览器窗口里完成登录，然后点「登录完成，继续」；"
+            f"登不进去就点「放弃登录」。当前页: {url}"
+        )
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=st.login_wait_seconds)
+        except asyncio.TimeoutError:
+            log.warning("任务 %s 等待登录超时（%.0fs），按未登录处理",
+                        tid, st.login_wait_seconds)
+            return False
+        finally:
+            if t.get("status") == "waiting_login":
+                t["status"] = "running"
+            t["login_hint"] = ""
+        return not bool(t.get("_login_aborted"))
+
     cm = None
     try:
         t["offline"] = bool(req.mock)
@@ -335,6 +414,8 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             run_dir=run_dir,
             confirm=None,  # 服务端无交互终端 → 敏感操作一律拒绝（安全默认）
             max_steps=req.max_steps,
+            # mock 模式下不交接登录：离线替身没有真实浏览器窗口可看
+            login_handoff=None if req.mock else _login_handoff,
         )
 
         t.update({

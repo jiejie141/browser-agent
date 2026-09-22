@@ -380,7 +380,7 @@ class _FakeSession:
 def _run_script(monkeypatch, tmp_path, script: list[str]):
     """用剧本化的离线模型跑一遍，返回 RunResult。"""
 
-    async def fake_perceive(page, settings, *, step, run_dir, prefer_vision=False):  # noqa: ANN001, ARG001
+    async def fake_perceive(page, settings, *, step, run_dir, prefer_vision=False, vlm=None):  # noqa: ANN001, ARG001
         return PageState(
             step=step, url="https://books.toscrape.com/", title="All products",
             body_text=SCENE_PAGE,

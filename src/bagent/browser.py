@@ -216,14 +216,43 @@ class BrowserSession:
 
         label = (await locator.first.inner_text() or "").strip()[:60]
 
-        # 敏感操作护栏
-        if _is_sensitive(label) and confirm is not None:
-            approved = await confirm(f"即将点击可能产生实际后果的按钮: 「{label}」")
+        # 敏感操作护栏。
+        #
+        # ⚠️ 原写法是 `if _is_sensitive(label) and confirm is not None:` ——
+        # 也就是**没有确认回调时整条护栏被跳过**，敏感按钮照点不误。
+        # 而 API 服务（api.py）正是传 `confirm=None`（它本来想表达
+        # "服务端无交互终端 → 一律拒绝"），结果是**服务端模式下护栏完全失效**：
+        # 注释写着"一律拒绝"，代码做的是"一律放行"。
+        #
+        # 默认必须是最保守的那个：**没人能确认 = 不放行**。
+        # 这跟 CLI 里那条"非交互环境自动拒绝"是同一个默认值（见 cli.py）。
+        if _is_sensitive(label):
+            approved = (
+                await confirm(f"即将点击可能产生实际后果的按钮: 「{label}」")
+                if confirm is not None
+                else False
+            )
             if not approved:
-                return StepOutcome(ok=False, message=f"人工拒绝了敏感操作「{label}」，已跳过")
+                return StepOutcome(
+                    ok=False,
+                    message=(
+                        f"敏感操作「{label}」未获确认，已拦截"
+                        f"（无交互终端时默认拒绝，这是安全默认值，不是故障）"
+                    ),
+                )
 
         await locator.first.scroll_into_view_if_needed()
-        await locator.first.click(timeout=self.settings.step_timeout_seconds * 1000)
+        try:
+            await locator.first.click(timeout=self.settings.step_timeout_seconds * 1000)
+        except Exception as exc:
+            # 把 Playwright 的原始报错翻译成**模型能据以改动作**的话。
+            # 不翻译的后果是实测过的（见 translate_click_error 的说明）：
+            # 模型只收到一句 "Timeout 30000ms exceeded"，它会以为"再点一次就行"。
+            return StepOutcome(
+                ok=False,
+                message=translate_click_error(exc, ref),
+                vision_hint=True,
+            )
         await self._settle()
         return StepOutcome(ok=True, message=f"已点击 [{ref}] 「{label}」")
 
@@ -281,6 +310,78 @@ class BrowserSession:
 def _is_sensitive(label: str) -> bool:
     low = (label or "").lower()
     return any(p in low for p in SENSITIVE_PATTERNS)
+
+
+# 点击失败时，Playwright 原始报错里值得单独翻译的几种形态。
+#
+# ⚠️ 顺序有意义：**越具体的排在前面**。同一条报错里可能同时出现多个关键词
+# （比如"等它可见且稳定"里既有 visible 也有 stable），先命中的那条才是对的。
+#
+# ## 为什么必须翻译（这是实测打出来的，不是"提示词优化"）
+#
+# 不翻译时，模型收到的是：
+#
+#     TimeoutError: Timeout 30000ms exceeded.
+#     Call log:
+#       - waiting for locator("[data-ba-ref=\\"37\\"]")
+#       - locator resolved to <a class="news-title">…</a>
+#       - attempting click action
+#       - waiting for element to be visible, enabled and stable
+#       - element is not stable
+#
+# 这里真正有用的信息只有最后一行 **"element is not stable"**（元素在轮播，
+# 永远等不到稳定），而它被埋在 6 行堆栈中间。实测（README 第八节 8.11）：
+# 必应首页上模型去点「热点资讯」里的新闻标题，耗满 30 秒超时，
+# 收到的就是这一大坨 —— 于是它**再点一次**，再耗 30 秒。12 次点击里 4 次超时。
+#
+# 翻译的原则：**说清"为什么点不到"+"下一步该做什么"，并且禁止重试同一个元素**。
+# 只说"超时"是不够的 —— 超时是现象，"在轮播"才是原因，而模型需要的是原因。
+_CLICK_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "not stable",
+        "这个元素一直在动（轮播 / 动画 / 不断重排），等不到它停下来，"
+        "**再点多少次都一样**。请换做法：改用 press(Enter)、点另一个入口，"
+        "或直接用 goto 打开一个明确的网址。",
+    ),
+    (
+        "intercepts pointer events",
+        "这个元素被别的浮层挡住了，点不到。请先 scroll 让页面重新布局、"
+        "或关掉遮挡物（弹窗 / 悬浮条），再考虑点它；不要重复点。",
+    ),
+    (
+        "not visible",
+        "这个元素当前不可见（折叠菜单 / 隐藏区域），点不了。"
+        "请先展开它所在的区域（点父级菜单或先 scroll），或换一个可见的入口。",
+    ),
+    (
+        "outside of the viewport",
+        "这个元素在可视区域之外，点不了。请先 scroll 把它滚进视口再点，"
+        "或直接用 goto。",
+    ),
+    (
+        "not enabled",
+        "这个元素当前是禁用状态（灰掉 / disabled），点了也不会有反应。请换别的做法。",
+    ),
+)
+
+
+def translate_click_error(exc: Exception, ref: int | None = None) -> str:
+    """把点击动作的原始异常翻译成模型能据以改动作的一句话。纯函数，可单测。
+
+    兜底分支仍然要带上"别再点它"：模型最典型的反应就是原样重试，
+    而那会再烧一个 30 秒超时。
+    """
+    raw = str(exc) or ""
+    head = raw.strip().splitlines()[0] if raw.strip() else type(exc).__name__
+    low = raw.lower()
+    who = f"点击 [{ref}]" if ref is not None else "点击"
+    for marker, hint in _CLICK_ERROR_HINTS:
+        if marker in low:
+            return f"{who} 失败：{hint}（原始报错首行: {head[:80]}）"
+    return (
+        f"{who} 超时：等不到可点击状态（{head[:100]}）。"
+        f"请换一个入口（press / goto / 别的元素），**不要重复点这个**。"
+    )
 
 
 @asynccontextmanager
