@@ -317,11 +317,17 @@ def test_perception_call_signatures_match_usage():
     )
 
     sig_elem = inspect.signature(perception.extract_elements)
-    # extract_elements 只接 page —— 这里钉住"它不接受 limit"这个事实，
-    # 免得有人又在调用处补一个 limit 进去
-    assert list(sig_elem.parameters) == ["page"], (
-        f"extract_elements 的参数变成 {list(sig_elem.parameters)} 了，"
-        "siteprobe 的调用要同步"
+    # 真正要钉住的不是"有几个参数"，而是"**老调用点 `extract_elements(page)`
+    # 还能不能用**"：跨 frame 改造给它加了 max_frames，但只要它有默认值，
+    # 所有调用点就都不用改。所以这里改成"page 之后的参数必须都有默认值"。
+    params = list(sig_elem.parameters)
+    assert params and params[0] == "page", (
+        f"extract_elements 的第一个参数必须是 page，现在是 {params[:1]}"
+    )
+    extras = [p for p in params[1:] if sig_elem.parameters[p].default is inspect._empty]
+    assert not extras, (
+        f"extract_elements 多了没有默认值的位置参数 {extras}，"
+        "所有调用点（siteprobe / perception）都得跟着改"
     )
 
 

@@ -33,6 +33,12 @@ SENSITIVE_PATTERNS = (
 # 确认回调：收到动作描述，返回 True 表示放行
 ConfirmFn = Callable[[str], Awaitable[bool]]
 
+# 按编号找元素时最多翻几个 frame。
+#
+# 比感知层的 MAX_FRAMES（6）留一倍余量：感知只给 6 个 frame 里的元素编号，
+# 但编号一旦打上就是"页面上的事实"，动作层不该因为自己看得少而找不到它。
+REF_FRAME_SCAN = 12
+
 
 class SensitiveActionBlocked(RuntimeError):
     """人工拒绝了敏感操作。"""
@@ -81,6 +87,8 @@ class BrowserSession:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self.page: Page | None = None
+        # 持久化用户目录（留空 = 每次一个全新 context）。见 __aenter__ 里的取舍说明。
+        self._profile_dir: Path | None = None
 
     async def __aenter__(self) -> "BrowserSession":
         self._pw = await async_playwright().start()
@@ -98,18 +106,52 @@ class BrowserSession:
                 launch_kwargs["proxy"]["server"],
                 launch_kwargs["proxy"].get("bypass", "-"),
             )
-        self._browser = await self._pw.chromium.launch(**launch_kwargs)
-        self._context = await self._browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            user_agent=(
+
+        context_kwargs: dict = {
+            "viewport": {"width": 1440, "height": 900},
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             ),
-        )
+        }
+
+        profile = (getattr(self.settings, "persistent_profile_dir", "") or "").strip()
+        if profile:
+            # 持久化用户目录：Cookie / localStorage 落盘，**下一次运行还在**。
+            #
+            # 为什么值得做（README「能力边界」里白纸黑字写着没做的那一条）：
+            # 每次运行都开一个全新 context，"登录后才能看"的站点就变成了
+            # **每次都要重新登录** —— 而登录这一步在本项目里只能由人来做，
+            # 于是它退化成"每跑一次任务就要人干预一次"。有头模式 + 持久化目录
+            # 之后，人登一次就够，之后同一站点直接带着会话继续跑。
+            #
+            # ⚠️ 代价必须一起说清楚：
+            #   1. 这个目录会**长期保存登录态**，等于把账号凭据放在磁盘上 ——
+            #      只该放在本机、不该进仓库（.gitignore 已排除），也不该共享；
+            #   2. 复用真实用户配置会让"这是自动化浏览器"更难掩饰，
+            #      反自动化站点可能**拦得更狠**（BOSS直聘那类就别指望它）；
+            #   3. 并发跑多个任务会抢同一个目录 —— 一个目录只能给一个运行用。
+            self._profile_dir = Path(profile).expanduser()
+            self._profile_dir.mkdir(parents=True, exist_ok=True)
+            log.info("使用持久化浏览器目录: %s", self._profile_dir)
+            self._context = await self._pw.chromium.launch_persistent_context(
+                user_data_dir=str(self._profile_dir),
+                **launch_kwargs,
+                **context_kwargs,
+            )
+        else:
+            self._browser = await self._pw.chromium.launch(**launch_kwargs)
+            self._context = await self._browser.new_context(**context_kwargs)
+
         self._context.set_default_timeout(self.settings.step_timeout_seconds * 1000)
-        self.page = await self._context.new_page()
+        # 持久化上下文启动时通常已经自带一个空白页，复用它，别再开一个
+        self.page = (
+            self._context.pages[0]
+            if self._context.pages
+            else await self._context.new_page()
+        )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -203,12 +245,58 @@ class BrowserSession:
         await self._settle()
         return StepOutcome(ok=True, message=f"已打开 {self.page.url}")
 
+    def _frames(self) -> list:
+        """主 frame 在前、其余随后的 frame 列表（用于按编号找元素）。"""
+        try:
+            main = self.page.main_frame
+        except Exception:
+            main = None
+        try:
+            rest = [f for f in self.page.frames if f is not main]
+        except Exception:
+            rest = []
+        ordered = ([main] + rest) if main is not None else rest
+        if not ordered:
+            # 拿不到 frame 列表时退回 page 本身：page.locator 等价于主 frame 的
+            # locator，行为与改造前完全一致（测试替身走的就是这一支）。
+            ordered = [self.page]
+        return ordered[:REF_FRAME_SCAN]
+
+    async def _locate_ref(self, ref: int):
+        """按编号定位元素，返回 `(frame, locator)`，找不到返回 `(None, None)`。
+
+        ## 为什么必须挨个 frame 找（README「能力边界」里写着没做的那一条）
+
+        `page.locator(...)` **只搜主文档**。感知层现在已经会给 iframe 里的元素
+        编号了（见 `perception.extract_elements`），但如果动作层还只认主文档，
+        那些编号就全是"看得见、点不到" —— 比不做更糟。
+
+        Playwright 本身能访问子 frame（它工作在浏览器层，不受同源策略限制），
+        缺的只是"换到那个 frame 上再查一次选择器"。
+
+        ⚠️ 编号是**全局**的（main 与 iframe 共用一套 1..N），所以同一个编号
+        在多个 frame 里不会重复 —— 找到第一个就返回是安全的。
+
+        另外：Playwright 的 CSS 选择器**默认穿透开放的 shadowRoot**，
+        所以影子 DOM 里的元素同样能被这个选择器命中，不需要特殊处理。
+        """
+        selector = f'[data-ba-ref="{ref}"]'
+        for frame in self._frames():
+            try:
+                locator = frame.locator(selector)
+                count = await locator.count()
+            except Exception:  # frame 正在导航 / 已 detach
+                continue
+            if count:
+                return frame, locator
+        return None, None
+
     async def _click(self, ref: int | None, confirm: ConfirmFn | None) -> StepOutcome:
         if ref is None:
             return StepOutcome(ok=False, message="click 缺少 ref 参数")
 
-        locator = self.page.locator(f'[data-ba-ref="{ref}"]')
-        if await locator.count() == 0:
+        _frame, locator = await self._locate_ref(ref)
+        if locator is None:
             return StepOutcome(
                 ok=False,
                 message=f"编号 [{ref}] 不存在——页面可能已经刷新，请重新查看元素清单",
@@ -261,8 +349,9 @@ class BrowserSession:
         if ref is None:
             return StepOutcome(ok=False, message="type 缺少 ref 参数")
 
-        locator = self.page.locator(f'[data-ba-ref="{ref}"]')
-        if await locator.count() == 0:
+        # 与 click 同一套查找逻辑：编号可能落在 iframe 里（见 _locate_ref）
+        _frame, locator = await self._locate_ref(ref)
+        if locator is None:
             return StepOutcome(
                 ok=False,
                 message=f"编号 [{ref}] 不存在，无法输入",

@@ -437,6 +437,19 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             2,
         )
 
+    def _handoff_verb(reason: str) -> str:
+        """这次交给人的是**登录**还是**验证码** —— 提示里的动词要跟着变。
+
+        走的是同一条交接通道（`login_handoff`），但叫人去做的事完全不同：
+        一个是要账号密码，一个只是滑一下滑块。让人看着"请去登录"去滑滑块，
+        是会让人愣住的 —— 而这两者的**可解决性**也完全不同（验证码 10 秒搞定，
+        登录可能根本没有账号）。
+        """
+        if any(k in (reason or "") for k in ("验证码", "人机验证", "人机校验", "滑块")):
+            return "完成验证"
+        return "完成登录"
+
+
     async def _login_handoff(url: str, reason: str) -> bool:
         """把"登录"这件事交给人：改状态、等事件、被叫醒。
 
@@ -456,16 +469,19 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             # 让人看得见，否则使用者只会看到任务莫名其妙地失败，
             # 不知道"改一个环境变量就能解决"。
             t["login_hint"] = (
-                f"⚠ {reason}。但本服务当前是**无头模式**，没有浏览器窗口可供你登录。"
+                f"⚠ {reason}。但本服务当前是**无头模式**，没有浏览器窗口可供你"
+                f"{_handoff_verb(reason)}。"
                 f"请把 .env 里的 HEADLESS 改成 false 后重试（或在桌面用启动器起服务）。"
                 f"当前页: {url}"
             )
-            log.warning("任务 %s 需要人工登录，但当前是无头模式，无法交接", tid)
+            log.warning("任务 %s 需要人工处理（%s），但当前是无头模式，无法交接",
+                        tid, _handoff_verb(reason))
             return False
         t["status"] = "waiting_login"
         t["login_hint"] = (
-            f"{reason}。请在浏览器窗口里完成登录，然后点「登录完成，继续」；"
-            f"登不进去就点「放弃登录」。当前页: {url}"
+            f"{reason}。请在浏览器窗口里{_handoff_verb(reason)}，"
+            f"然后点「我已完成，继续」；做不了就点「放弃，让 Agent 收尾」。"
+            f"当前页: {url}"
         )
         try:
             await asyncio.wait_for(ev.wait(), timeout=st.login_wait_seconds)
@@ -475,8 +491,8 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             # 超时也不能把原因清掉 —— 使用者需要知道"是我没来得及登"，
             # 而不是"这个任务就是做不了"。
             t["login_hint"] = (
-                f"⚠ 等待人工登录超时（{st.login_wait_seconds:.0f} 秒），"
-                f"已按「未登录」继续。原因：{reason}"
+                f"⚠ 等待人工{_handoff_verb(reason)}超时（{st.login_wait_seconds:.0f} 秒），"
+                f"已按「未完成」继续。原因：{reason}"
             )
             return False
         finally:
@@ -484,7 +500,8 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
                 t["status"] = "running"
         aborted = bool(t.get("_login_aborted"))
         t["login_hint"] = (
-            f"⚠ 你选择了放弃登录，已按「未登录」继续。原因：{reason}" if aborted else ""
+            f"⚠ 你选择了放弃{_handoff_verb(reason)}，已按「未完成」继续。原因：{reason}"
+            if aborted else ""
         )
         return not aborted
 

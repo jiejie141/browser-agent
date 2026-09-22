@@ -41,7 +41,31 @@ SCAN_CAP = 500
 # 又挡得住"几百个分类链接"。
 CHROME_QUOTA = 25
 
+# 一条扫描路径最多往下钻多少层 shadowRoot。
+#
+# 正常的 Web Components 嵌套不超过 2~3 层；设上限是为了防住"组件里套自己"
+# 那种写法 —— 每层都要把整棵子树 querySelectorAll 一遍，层数一多就是纯浪费。
+_SHADOW_DEPTH = 5
+
+# 一趟感知最多扫几个 frame。
+#
+# 为什么要有上限：门户/新闻站一页能挂几十个广告 iframe，全扫一遍等于每步
+# 多做几十次跨进程 evaluate，感知延迟会直接吃掉步数预算。取 6 是折中 ——
+# 够覆盖"正文里嵌了一两个 iframe"的真实场景，又挡得住广告位洪泛。
+MAX_FRAMES = 6
+
 # 收集候选元素的 JS（第一趟，只扫不编号）。在浏览器上下文里执行。
+#
+# ## 为什么里面要递归下钻 shadowRoot（README「能力边界」里写着没做的那一条）
+#
+# `document.querySelectorAll(...)` **看不见影子 DOM 里的节点**。Web Components
+# 站点（大量后台系统、部分新版电商/文档站）把按钮全封在 shadowRoot 里，
+# 于是整页一个元素都抽不到 —— 表现是"页面上明明有按钮，Agent 却说没有"，
+# 然后只能降级去走又贵又不精确的视觉通道。
+#
+# ⚠️ 只有 **open** 模式的 shadowRoot 拿得到：closed 的在 JS 里就是 `null`，
+# Playwright 的选择器同样进不去。那种页面仍然只能走视觉通道 ——
+# 这是浏览器的安全边界，不是本项目能补的。
 #
 # ⚠️ maxScan 必须由 Python 侧显式传进来，别指望"不传就是默认值"：
 # Playwright 在调用方不给参数时传进来的是 **null 而不是 undefined**，
@@ -58,9 +82,6 @@ _COLLECT_JS = """
   const CHROME_WORDS = /(^|[-_ ])(nav|navbar|navigation|menu|sidebar|aside|footer|header|topbar|toolbar|breadcrumb|catalog|category|categories|pagination|pager|tabbar)([-_ ]|$)/i;
   const MAIN_WORDS = /(^|[-_ ])(main|content|article|post|detail|result|results|list|feed|goods|item)([-_ ]|$)/i;
 
-  // 清掉上一次的标记，避免 ref 编号错位到已经消失的元素上
-  document.querySelectorAll('[data-ba-ref]').forEach(el => el.removeAttribute('data-ba-ref'));
-
   const selector = [
     'a', 'button', 'input', 'textarea', 'select',
     '[role="button"]', '[role="link"]', '[role="tab"]',
@@ -68,7 +89,22 @@ _COLLECT_JS = """
     '[contenteditable="true"]', '[onclick]'
   ].join(',');
 
-  const nodes = Array.from(document.querySelectorAll(selector));
+  // 要扫的"根"：主文档 + 所有开放的 shadowRoot
+  const roots = [];
+  (function walk(r, depth) {
+    roots.push(r);
+    if (depth >= 5) return;
+    let all;
+    try { all = r.querySelectorAll('*'); } catch (e) { return; }
+    for (const el of all) {
+      if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+    }
+  })(document, 0);
+
+  // 清掉上一次的标记（影子 DOM 里的也要清），避免 ref 编号错位到已经消失的元素上
+  for (const r of roots) {
+    r.querySelectorAll('[data-ba-ref]').forEach(el => el.removeAttribute('data-ba-ref'));
+  }
 
   const visible = (el) => {
     const r = el.getBoundingClientRect();
@@ -108,17 +144,22 @@ _COLLECT_JS = """
   };
 
   const cands = [];
-  for (const el of nodes) {
-    if (cands.length >= cap) break;
-    if (!visible(el)) continue;
-    cands.push({
-      el: el,
-      tag: el.tagName.toLowerCase(),
-      text: label(el),
-      aria: String(el.getAttribute('aria-label') || '').slice(0, 60),
-      placeholder: String(el.getAttribute('placeholder') || '').slice(0, 60),
-      region: regionOf(el)
-    });
+  // 按 root 顺序扫：先主文档、再各层 shadowRoot，保证编号顺序大体跟随视觉顺序
+  for (const root of roots) {
+    let nodes;
+    try { nodes = Array.from(root.querySelectorAll(selector)); } catch (e) { continue; }
+    for (const el of nodes) {
+      if (cands.length >= cap) break;
+      if (!visible(el)) continue;
+      cands.push({
+        el: el,
+        tag: el.tagName.toLowerCase(),
+        text: label(el),
+        aria: String(el.getAttribute('aria-label') || '').slice(0, 60),
+        placeholder: String(el.getAttribute('placeholder') || '').slice(0, 60),
+        region: regionOf(el)
+      });
+    }
   }
 
   // 元素引用挂到 window 上，第二趟按分配结果编号时复用同一批 DOM 节点。
@@ -159,9 +200,43 @@ _BODY_TEXT_JS = """
     // 太短说明这个 landmark 不是真正的内容容器，回退整页
     if (t.length >= 200) return t;
   }
-  return document.body ? document.body.innerText : '';
+  let t = document.body ? String(document.body.innerText || '').trim() : '';
+
+  // 影子 DOM 里的文字**不在** body.innerText 里（innerText 只沿 light DOM 走）。
+  // Web Components 站点读出来会是空的 —— 那正是"抽不到元素、也读不到正文、
+  // 只能去走视觉通道"的那类页面。正文短得可疑时补一趟影子树的文本。
+  if (t.length < 200) {
+    const parts = [];
+    (function walk(r, depth) {
+      if (depth >= 5) return;
+      let all;
+      try { all = r.querySelectorAll('*'); } catch (e) { return; }
+      for (const el of all) {
+        if (el.shadowRoot) {
+          const s = String(el.shadowRoot.textContent || '').trim();
+          if (s) parts.push(s);
+          walk(el.shadowRoot, depth + 1);
+        }
+      }
+    })(document, 0);
+    if (parts.length) t = t ? (t + '\\n' + parts.join('\\n')) : parts.join('\\n');
+  }
+  return t;
 }
 """
+
+# 主文档正文短于这个字数时，才去补 iframe 里的正文。
+#
+# 为什么用"主文档太短"当开关：正文够长说明内容就在主文档里，再拼接子框架的
+# 文字只会把广告、埋点脚本的文本混进来；只在"主文档基本没内容"时才补，
+# 补的就是那个真正装着正文的 iframe。
+FRAME_BODY_MIN_CHARS = 400
+
+# 拼接 iframe 正文时的分隔标记。
+#
+# 必须显式标出来：模型拿到的正文摘要要能区分"这段话来自主页面"还是
+# "来自页面里嵌的另一个文档"，否则它会在引用证据时混淆来源。
+_FRAME_BODY_MARK = "—— 以下内容来自页面内嵌的 iframe ——"
 
 
 def region_of(candidates: list[dict], region: str) -> list[dict]:
@@ -216,45 +291,110 @@ def allocate(
     room = max(0, max_elements - len(picked))
     picked += keep_chrome[: min(chrome_quota, room)]
 
-    picked.sort(key=lambda c: c.get("idx", 0))
-    return [(int(c["idx"]), i + 1) for i, c in enumerate(picked)]
+    # 排序键用 gidx（跨 frame 的全局顺序）；单 frame 的老数据没有这个字段，
+    # 退回 idx，行为与改造前完全一致。
+    picked.sort(key=lambda c: c.get("gidx", c.get("idx", 0)))
+    return [(int(c.get("gidx", c["idx"])), i + 1) for i, c in enumerate(picked)]
 
 
-async def extract_elements(page: Page) -> list[Element]:
-    """通道 A：抽取可交互元素并打上编号。
+def _ordered_frames(page: Page, max_frames: int = MAX_FRAMES) -> list:
+    """要扫的 frame 列表：**主 frame 一定排在最前**，其余按浏览器给的顺序补齐。
 
-    分两趟：
-      1. 扫（不编号）→ 拿到候选 + 区域归属；
-      2. 在 Python 里按区域配额决定给谁编号（allocate 是纯函数，可单测）；
-      3. 回写编号。
-
-    **为什么非要分两趟**：分配策略放在 JS 里就只能靠跑真实浏览器来验证，
-    而"侧栏抢名额"这类 bug 恰恰只在真实页面上暴露，定位成本极高。
-    搬到 Python 之后，用几条构造的候选就能把策略钉死。
+    主 frame 排第一不是形式主义 —— 编号预算只有 100 个，而"用户真正看到的
+    那一层"理应优先拿到名额，不能被广告 iframe 抢在前面。
     """
     try:
-        # SCAN_CAP 必须显式传 —— 见 _COLLECT_JS 顶部的注释：
-        # 不传参时 Playwright 给的是 null，会让候选直接变成空列表。
-        raw = await page.evaluate(_COLLECT_JS, SCAN_CAP)
-    except Exception as exc:  # 页面正在跳转时 evaluate 会失败，属于正常抖动
-        log.warning("抽取元素失败（页面可能正在导航）: %s", exc)
-        return []
-
-    cands = [c for c in (raw or []) if isinstance(c, dict) and "idx" in c]
-    if not cands:
-        return []
-
-    pairs = allocate(cands)
+        main = page.main_frame
+    except Exception:
+        main = None
     try:
-        await page.evaluate(_APPLY_JS, [[idx, ref] for idx, ref in pairs])
-    except Exception as exc:
-        log.warning("回写元素编号失败: %s", exc)
+        rest = [f for f in page.frames if f is not main]
+    except Exception:
+        rest = []
+    ordered = ([main] + rest) if main is not None else rest
+    return ordered[:max_frames]
+
+
+async def extract_elements(page: Page, max_frames: int = MAX_FRAMES) -> list[Element]:
+    """通道 A：抽取可交互元素并打上编号。
+
+    分三趟：
+      1. **逐个 frame 扫**（不编号）→ 拿到候选 + 区域归属；
+      2. 在 Python 里按区域配额决定给谁编号（allocate 是纯函数，可单测）；
+      3. 把编号**回写到元素所在的那个 frame**。
+
+    ## 为什么要跨 frame（README「能力边界」里写着没做的那一条）
+
+    `page.evaluate(...)` 只作用于**主 frame**。正文嵌在 iframe 里的页面
+    （老式后台系统、嵌入式文档、部分视频/地图站）因此一个元素都抽不到 ——
+    表现是"页面上明明有按钮，Agent 却说没有"，然后降级去走视觉通道。
+    Playwright 本身**能**访问子 frame（它工作在浏览器层，不受同源策略限制），
+    缺的只是"挨个扫一遍、把编号打回各自的 frame"。
+
+    ## 为什么要三趟而不是两趟
+
+    分配策略放在 JS 里就只能靠跑真实浏览器来验证，而"侧栏抢名额"这类 bug
+    恰恰只在真实页面上暴露，定位成本极高。搬到 Python 之后，用几条构造的
+    候选就能把策略钉死。
+
+    ⚠️ 编号是**全局**的：main 与 iframe 里的元素共用一套 1..N，
+    所以模型不需要知道元素在哪个 frame —— 动作层按编号自己找（见 browser）。
+    """
+    frames = _ordered_frames(page, max_frames)
+
+    all_cands: list[dict] = []
+    frame_of: dict[int, object] = {}
+    for fi, frame in enumerate(frames):
+        try:
+            # SCAN_CAP 必须显式传 —— 见 _COLLECT_JS 顶部的注释：
+            # 不传参时 Playwright 给的是 null，会让候选直接变成空列表。
+            raw = await frame.evaluate(_COLLECT_JS, SCAN_CAP)
+        except Exception as exc:  # 页面正在跳转/frame 已detach，属于正常抖动
+            log.warning("抽取元素失败（frame %d，页面可能正在导航）: %s", fi, exc)
+            continue
+        cands = [c for c in (raw or []) if isinstance(c, dict) and "idx" in c]
+        if not cands:
+            continue
+        frame_of[fi] = frame
+        offset = len(all_cands)
+        for i, c in enumerate(cands):
+            # idx 仍是**本 frame 内**的下标（回写编号时要用），
+            # gidx 是跨 frame 的全局下标（排序/分配/反查要用）。
+            all_cands.append({**c, "gidx": offset + i, "frame": fi})
+
+    if not all_cands:
         return []
 
-    by_idx = {c["idx"]: c for c in cands}
+    pairs = allocate(all_cands)
+    if not pairs:
+        return []
+
+    # 拆回各 frame：编号必须打在元素所在的那个 frame 上，
+    # 打在主 frame 上会"编号存在但点不到"（选择器在主文档里找不到它）。
+    owner: dict[int, tuple[int, int]] = {
+        int(c["gidx"]): (int(c.get("frame", 0)), int(c["idx"]))
+        for c in all_cands
+    }
+    by_frame: dict[int, list[list[int]]] = {}
+    for gidx, ref in pairs:
+        fi, lidx = owner.get(int(gidx), (0, int(gidx)))
+        by_frame.setdefault(fi, []).append([lidx, ref])
+
+    for fi, apply_pairs in by_frame.items():
+        frame = frame_of.get(fi)
+        if frame is None:
+            continue
+        try:
+            await frame.evaluate(_APPLY_JS, apply_pairs)
+        except Exception as exc:
+            # 编号没写全就不要往外报：报出来的编号点不到，比"没元素"更误导。
+            log.warning("回写元素编号失败（frame %d）: %s", fi, exc)
+            return []
+
+    by_gidx = {int(c["gidx"]): c for c in all_cands}
     elements: list[Element] = []
-    for idx, ref in pairs:
-        c = by_idx.get(idx)
+    for gidx, ref in pairs:
+        c = by_gidx.get(int(gidx))
         if c is None:
             continue
         try:
@@ -266,6 +406,7 @@ async def extract_elements(page: Page) -> list[Element]:
                     aria=str(c.get("aria", "")),
                     placeholder=str(c.get("placeholder", "")),
                     region=str(c.get("region", "neutral")),
+                    frame=int(c.get("frame", 0)),
                 )
             )
         except Exception:
@@ -395,6 +536,116 @@ def detect_blank_page(
     return True, f"页面已变成空白页（{url or 'about:blank'}），正文与可交互元素都为空"
 
 
+# ---------------------------------------------------------------------------
+# 验证码 / 人机校验识别
+#
+# ## 为什么"不处理验证码"还不够，必须单独识别它
+#
+# 引擎确实解不了滑块和点选 —— 这件事没变，也不该假装能解。
+# 但"解不了"和"认不出来"是两回事：认不出来时模型看到的是
+# "页面上有些字 + 点不动"，它会**一遍遍去点那个滑块**，把步数烧光；
+# 认出来之后，正确处置是**把它交给人**（人 10 秒就滑完了），
+# 而不是让模型原地磨损。
+#
+# 所以这里只做一件事：**把"这是验证码"这件事实报上去**，
+# 并在给模型的提示里明确禁止继续尝试。
+# ---------------------------------------------------------------------------
+
+# 网址里的验证码信号
+_CAPTCHA_URL_RE = re.compile(
+    r"(?:^|[/&?._-])(captcha|recaptcha|hcaptcha|turnstile|geetest|yidun"
+    r"|security[-_]?check|verify[-_]?(human|robot)|anti[-_]?bot|challenge)",
+    re.IGNORECASE,
+)
+
+# 页面文案里的验证码信号
+_CAPTCHA_TEXT_MARKERS = (
+    "验证码", "图形验证码", "滑动验证", "拖动滑块", "向右滑动", "完成拼图",
+    "请完成安全验证", "安全验证", "人机验证", "人机校验", "行为验证",
+    "请依次点击", "请按顺序点击", "点击图中", "请在下图",
+    "captcha", "recaptcha", "hcaptcha", "slide to verify",
+    "verify you are human", "i'm not a robot", "security check",
+)
+
+# 只靠文案就能定案的**强信号**：这些话基本只出现在验证码上，
+# 不像"登录"那样在普通导航里也到处都是。
+_CAPTCHA_STRONG_MARKERS = (
+    "滑动验证", "拖动滑块", "向右滑动", "完成拼图", "请完成安全验证",
+    "人机验证", "人机校验", "请依次点击", "请按顺序点击", "点击图中",
+    "slide to verify", "verify you are human", "i'm not a robot",
+)
+
+# 验证码控件的 DOM 探测。命中最强的那一条证据 ——
+# 第三方验证框（极验 / 易盾 / reCAPTCHA / 腾讯防水墙）都是 iframe 或固定 class。
+#
+# ⚠️ 只数**看得见**的：很多站点把验证容器预先埋在 DOM 里（display:none），
+# 光看存在性会把"能正常读的页面"误判成"被验证码挡住"。
+_HAS_CAPTCHA_JS = """
+() => {
+  const sel = [
+    'iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]',
+    'iframe[src*="turnstile"]', 'iframe[src*="captcha"]',
+    'iframe[src*="geetest"]', 'iframe[src*="yidun"]',
+    '[class*="captcha" i]', '[id*="captcha" i]',
+    '[class*="geetest"]', '[class*="yidun"]',
+    '[class*="nc_scale"]', '[class*="slider-verify"]',
+    '[class*="baxia"]'
+  ].join(',');
+  let n = 0;
+  for (const el of document.querySelectorAll(sel)) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 1 && r.height > 1) n += 1;
+  }
+  return n;
+}
+"""
+
+
+def detect_captcha(
+    url: str = "",
+    title: str = "",
+    body_text: str = "",
+    *,
+    has_captcha_widget: bool = False,
+) -> tuple[bool, str]:
+    """判断当前这一帧是不是**验证码 / 人机校验**。纯函数，可离线单测。
+
+    返回 `(是不是, 理由)`。三条判据，强度从高到低：
+
+      1. **页面上确实挂着一个可见的验证码控件** → 直接定案（最强）；
+      2. 网址 + 文案**同时**指向人机验证 → 定案；
+      3. 文案里出现**强信号**（"拖动滑块"这类只可能出现在验证码上的话）→ 定案。
+
+    为什么不把"网址命中"单独算数：`/account/verify-email`、`/user/security`
+    这类正常页面都会在网址里带 verify / security，单凭它定案会误伤。
+    """
+    if has_captcha_widget:
+        return True, "页面上出现了可见的验证码控件（滑块 / 点选 / 第三方验证框）"
+
+    u = (url or "").lower()
+    text = f"{title or ''}\n{body_text or ''}"
+    low = text.lower()
+
+    url_hit = bool(_CAPTCHA_URL_RE.search(u))
+    text_hit = any(m.lower() in low for m in _CAPTCHA_TEXT_MARKERS)
+    strong_hit = any(m.lower() in low for m in _CAPTCHA_STRONG_MARKERS)
+
+    if url_hit and text_hit:
+        return True, "网址与页面文案都指向人机验证"
+    if strong_hit:
+        return True, "页面文案明确要求完成人机验证（滑块 / 点选）"
+    return False, ""
+
+
+def _looks_maybe_captcha(url: str, title: str, body_text: str) -> bool:
+    """省一次 evaluate 的前置过滤（与登录墙那边同一个套路）。"""
+    u = (url or "").lower()
+    low = f"{title or ''}\n{body_text or ''}".lower()
+    if _CAPTCHA_URL_RE.search(u):
+        return True
+    return any(m.lower() in low for m in _CAPTCHA_TEXT_MARKERS)
+
+
 def _looks_maybe_login(url: str, title: str, body_text: str) -> bool:
     """网址或文案**有那么一点像**登录页 —— 用来决定要不要去查密码框。
 
@@ -409,12 +660,32 @@ def _looks_maybe_login(url: str, title: str, body_text: str) -> bool:
 
 
 async def extract_body_text(page: Page, max_chars: int = 4000) -> str:
-    """读正文。优先主内容区，避免几千字的导航/页脚把正文淹掉。"""
+    """读正文。优先主内容区，避免几千字的导航/页脚把正文淹掉。
+
+    主文档正文**短得可疑**时，逐个子 frame 补一次：正文整个装在 iframe 里的
+    页面（老式后台、嵌入式文档）按老办法读出来是空的，Agent 会以为"没内容"。
+    补的时候**显式标注来源**，免得模型把两个文档的文字混成一段证据。
+    """
     try:
         text = await page.evaluate(_BODY_TEXT_JS) or ""
     except Exception:
         return ""
     text = str(text).strip()
+
+    if len(text) < FRAME_BODY_MIN_CHARS:
+        for frame in _ordered_frames(page)[1:]:
+            try:
+                sub = await frame.evaluate(_BODY_TEXT_JS) or ""
+            except Exception:
+                continue
+            sub = str(sub).strip()
+            if not sub:
+                continue
+            text = f"{text}\n{_FRAME_BODY_MARK}\n{sub}" if text else (
+                f"{_FRAME_BODY_MARK}\n{sub}"
+            )
+            if len(text) >= max_chars:
+                break
     return text[:max_chars]
 
 
@@ -461,6 +732,18 @@ async def perceive(
     is_wall, wall_reason = detect_login_wall(
         url, title, body_text, has_password_field=has_pwd
     )
+
+    # 验证码比登录墙**更具体**：登录页里套一个滑块时，真正挡住去路的是滑块。
+    # 两个标志都留着，由引擎决定先看哪个（引擎侧的顺序是 验证码 > 登录墙）。
+    has_widget = False
+    if _looks_maybe_captcha(url, title, body_text):
+        try:
+            has_widget = bool(await page.evaluate(_HAS_CAPTCHA_JS))
+        except Exception:
+            has_widget = False
+    is_captcha, captcha_reason = detect_captcha(
+        url, title, body_text, has_captcha_widget=has_widget
+    )
     # "被清成空白页"与"被登录墙挡住"是两件不同的事实，但处置相同：
     # 都交给人来处理（详见 detect_blank_page 里的实测过程）。
     is_blank, blank_reason = detect_blank_page(
@@ -477,6 +760,8 @@ async def perceive(
         login_reason=wall_reason,
         is_blank_page=is_blank,
         blank_reason=blank_reason,
+        is_captcha=is_captcha,
+        captcha_reason=captcha_reason,
     )
 
     if need_vision:

@@ -88,6 +88,13 @@ class Element(BaseModel):
     # 表现是"页面上明明有搜索结果，Agent 却说不出来"。
     # 有了区域之后，编号分配就能按区域配额度（见 perception.allocate）。
     region: str = "neutral"
+    # 元素所在 frame 的序号：0 = 主文档，>0 = 第 N 个 iframe / shadow 宿主所在文档。
+    #
+    # 为什么要有它：编号是**全局**的（main 与 iframe 共用一套 1..N），所以模型
+    # 不需要知道元素在哪个 frame —— 但**人复盘时需要**：trace 里看到
+    # "点了 [37] 却没反应"，第一件要确认的就是它到底在哪个文档里。
+    # 动作层也靠 perception 记录的这个序号把编号解析回正确的 frame。
+    frame: int = 0
 
 
 def _elide_ordered(text: str, budget: int) -> str:
@@ -164,6 +171,14 @@ class PageState(BaseModel):
     # 否则给模型的提示会指错方向（"去登录"vs"页面被清空了，先别急着下结论"）。
     is_blank_page: bool = False
     blank_reason: str = ""
+    # 这一帧是不是**验证码 / 人机校验**。
+    #
+    # 与登录墙并列，但**更具体**：登录页里嵌一个滑块时，真正挡路的是滑块。
+    # 引擎侧的处置优先级是 验证码 > 登录墙 —— 前者人可以立刻解决，
+    # 后者要账号。认出来的意义不是"引擎会解"（它解不了），而是
+    # **别让模型一遍遍去点那个滑块**。
+    is_captcha: bool = False
+    captcha_reason: str = ""
 
     def render_for_prompt(self, max_body_chars: int = 3000) -> str:
         """渲染成给模型看的纯文本。控制长度就是控制成本。
@@ -194,6 +209,10 @@ class PageState(BaseModel):
                 # 一是省 token，二是模型最常犯的错就是把侧栏里的相关推荐
                 # 当成"第一条搜索结果"，这个标记正好压住它。
                 mark = " [导航/侧栏]" if el.region == "chrome" else ""
+                # 标出来它不在主文档里：模型要点击时不需要知道（编号是全局的），
+                # 但它解释"为什么点不到/为什么正文里没这段"时需要。
+                if el.frame:
+                    mark += f" [iframe#{el.frame}]"
                 lines.append(f"  [{el.ref}] <{el.tag}> {label}{mark}")
             if any(el.region == "chrome" for el in self.elements):
                 lines += [
@@ -204,6 +223,23 @@ class PageState(BaseModel):
         else:
             lines.append("  (这一帧没有解析到可交互元素——可能是页面还在加载，")
             lines.append("   或者内容在 Canvas / iframe 里，可以试试 scroll 或 screenshot)")
+
+        if self.is_captcha:
+            # 这一段的关键不是"描述页面"，而是**禁止一类动作**。
+            # 实测形态：模型看见"向右滑动填充拼图"就去点/拖那个滑块，
+            # 一次不行再来一次，步数全烧在这上面 —— 而它永远不可能通过。
+            lines += [
+                "",
+                f"⚠ 当前页面是**验证码 / 人机校验**（判定依据：{self.captcha_reason}）。",
+                "引擎**解不了**滑块和点选 —— 这不是努力程度的问题，"
+                "再点、再拖、换个姿势重试都**不会**通过，只会把步数烧光。",
+                "现在正确的做法只有一个：**停下来，把这一步交给人**。"
+                "人会在真实浏览器窗口里完成验证，验证通过后你会自动接着往下走。",
+                "**不要**尝试 click / scroll / press 去绕过它，"
+                "也不要据此下「内容不存在」的结论 —— 验证码后面就是内容。",
+                "如果一直没有人来完成验证，就 finish 说明"
+                "「遇到验证码，需要人工处理」。",
+            ]
 
         if self.is_login_wall:
             # 把"你被挡住了"这件模型自己看不出来的事说清楚。

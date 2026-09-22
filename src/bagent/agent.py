@@ -465,6 +465,26 @@ def page_blocked_warning(reason: str) -> str:
     )
 
 
+def captcha_blocked_warning(reason: str) -> str:
+    """「这是验证码，而且没人来处理」时的注入文本。两个引擎共用一份。
+
+    与 `login_blocked_warning` 的差别：那个还能给出"换个公开入口"这条出路，
+    这个**没有** —— 验证码是横在路中间的一扇门，绕不过去，只能由人来开。
+    所以这里的措辞重点是**禁止继续尝试**，而不是"换个地方试试"。
+    """
+    return (
+        f"⚠ 当前页面要求完成验证码 / 人机校验（{reason}）。\n"
+        "**引擎解不了滑块和点选** —— 继续 click、scroll、press 都不会让它通过，"
+        "只会把剩下的步数全部烧光。\n"
+        "请按下面的顺序：\n"
+        "  (a) 停下来，把这一步交给人（控制台会弹出「请你完成验证」，"
+        "人在真实浏览器窗口里滑一下就好），验证通过后你会自动接着往下走；\n"
+        "  (b) 如果确认没有人会来处理，立刻 finish，在 answer 里写明"
+        "「遇到验证码，需要人工完成」（这类结论免检 evidence）。\n"
+        "**不要**把「被验证码挡住了」当成「网站上没有这份内容」—— 门后面就是内容。"
+    )
+
+
 def login_blocked_warning(reason: str) -> str:
     """「这是登录墙，而且没人能登录」时的注入文本。两个引擎共用一份。
 
@@ -657,8 +677,15 @@ class ReActAgent:
             # 不如直接说"你被挡住了、顺序还反了"。
             if state.is_blank_page:
                 blank_hits += 1
+            # 三条拦截的**优先级**：验证码 > 登录墙 > 空白页。
+            #
+            # 验证码排最前，因为它是**最具体**的解释：登录页里嵌一个滑块时，
+            # 告诉模型"你在登录墙前面"是对的但没用 —— 真正挡路的是滑块，
+            # 而滑块是**人 10 秒就能解决**的东西，值得单独叫人。
             blocked_reason = ""
-            if state.is_login_wall:
+            if state.is_captcha:
+                blocked_reason = state.captcha_reason
+            elif state.is_login_wall:
                 blocked_reason = state.login_reason
             elif blank_hits >= BLANK_STRIKES:
                 blocked_reason = state.blank_reason
@@ -669,6 +696,10 @@ class ReActAgent:
                     handoff_tried = True
                     landing = state.url
                     hopeless = ""
+                    # 验证码**不能**跳走再叫人：它就在当前这一页上，
+                    # 跳到站点首页反而把要滑的那个滑块弄没了。
+                    # （下面那段"换到首页再确认"的逻辑只服务于空白页。）
+                    skip_renavigate = state.is_captcha
                     # ⚠️ 空白页触发时，先挪到站点首页 —— **但必须确认那一页真的能用**。
                     #
                     # 为什么非要回头确认一次（实测教训，2026-09-22）：BOSS直聘 即使
@@ -678,8 +709,8 @@ class ReActAgent:
                     # 一样登不进去（页面已经没了）。
                     # 所以：换过去还是空白 → 就不要弹"请去登录"，那是在骗人，
                     # 直接按"站点阻止自动化"收场。
-                    if state.is_blank_page and pre_login_url \
-                            and pre_login_url != state.url:
+                    if state.is_blank_page and not skip_renavigate \
+                            and pre_login_url and pre_login_url != state.url:
                         await session.execute(
                             Action(action="goto", url=pre_login_url), confirm=confirm
                         )
@@ -710,6 +741,9 @@ class ReActAgent:
                             log.warning("登录交接失败，按未登录处理: %s", exc)
                         if resumed:
                             login_done = True
+                            # 交接的**种类**要分开写进 trace：复盘时"人滑了个验证码"
+                            # 和"人登了个账号"是两件完全不同的事。
+                            kind = "验证码交接" if state.is_captcha else "登录交接"
                             # 登录之后世界变了：清掉所有"基于旧页面"的判据状态。
                             # 不清的后果很具体 —— 登录页↔内容页那几个旧指纹还在
                             # fp_history 里，登录后第一步就会被判成"又在振荡"，
@@ -726,27 +760,41 @@ class ReActAgent:
                             blank_hits = 0
                             # 回到任务入口：登录之前打开的往往是登录页，
                             # 只有重新打开起始网址，内容才真的在。
-                            await session.execute(
-                                Action(action="goto", url=start_url), confirm=confirm
+                            # ⚠️ 验证码**不**重开：它就在当前页上，跳走会把
+                            # 刚滑完才通过的那次验证作废（页面重新加载 = 重新校验）。
+                            if skip_renavigate:
+                                tail = "，留在当前页面继续"
+                            else:
+                                await session.execute(
+                                    Action(action="goto", url=start_url), confirm=confirm
+                                )
+                                tail = f"，回到任务入口 {start_url}"
+                            headline = (
+                                "人已完成验证码" if state.is_captcha else "已完成登录"
                             )
                             records.append(
                                 StepRecord(
-                                    step=step, action=None, raw_action="登录交接",
+                                    step=step, action=None, raw_action=kind,
                                     ok=True,
-                                    message=f"已完成登录，回到任务入口 {start_url}",
+                                    message=f"{headline}{tail}",
                                     url_after=session.page.url if session.page else "",
                                     screenshot_path=state.screenshot_path,
-                                    # 登录前那一帧的指纹（下面马上会清空历史）：
-                                    # 留着它，复盘时才能看出"登录前后页面确实变了"。
+                                    # 拦截前那一帧的指纹（下面马上会清空历史）：
+                                    # 留着它，复盘时才能看出"交接前后页面确实变了"。
                                     page_fp=page_fingerprint(state),
                                     stall_count=0, osc_pages=osc_warned,
                                 )
                             )
                             if self.on_step:
-                                self.on_step(step, None, True, "已完成登录，回到任务入口")
+                                self.on_step(step, None, True, f"{headline}{tail}")
                             history.append(
-                                f"第 {step} 步: 登录已完成，已重新打开任务入口 {start_url}。"
-                                f"现在按任务要求去找内容 —— 顺序是**先登录后找内容**，不要反过来。"
+                                f"第 {step} 步: {headline}{tail}。"
+                                + (
+                                    "现在按任务要求继续 —— **不要**再去碰验证码控件。"
+                                    if state.is_captcha
+                                    else
+                                    "现在按任务要求去找内容 —— 顺序是**先登录后找内容**，不要反过来。"
+                                )
                             )
                             history = trim_history(history)
                             continue
@@ -756,13 +804,17 @@ class ReActAgent:
                 # 节流不能把第一次提醒也节掉（否则前面几步它还在盲目横跳）。
                 if login_notified_at == 0 or step - login_notified_at >= LOGIN_NOTIFY_EVERY:
                     login_notified_at = step
-                    # 两种拦截的措辞**不能混用**：登录墙要它"别横跳、先登录"，
-                    # 空白页要它"别拿空白当证据去下结论"。指错方向比不说更糟。
-                    history.append(
-                        login_blocked_warning(blocked_reason)
-                        if state.is_login_wall
-                        else page_blocked_warning(blocked_reason)
-                    )
+                    # 三种拦截的措辞**不能混用**：
+                    #   验证码 → 别再点那个滑块；
+                    #   登录墙 → 别横跳、先登录；
+                    #   空白页 → 别拿空白当证据去下结论。
+                    # 指错方向比不说更糟 —— 每一条对应的"下一步该做什么"完全不同。
+                    if state.is_captcha:
+                        history.append(captcha_blocked_warning(blocked_reason))
+                    elif state.is_login_wall:
+                        history.append(login_blocked_warning(blocked_reason))
+                    else:
+                        history.append(page_blocked_warning(blocked_reason))
 
             # ---------- 停滞检测：这一步到底有没有得到新信息？----------
             # 放在"想（Reason）"**之前**，是为了让下面的警告进到本轮 prompt 里 ——

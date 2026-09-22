@@ -177,6 +177,21 @@ class Settings:
         default_factory=lambda: _get_float("TEARDOWN_TIMEOUT_SECONDS", 8.0)
     )
 
+    # 持久化浏览器目录（**留空 = 每次运行一个全新 context**，默认值，也是安全值）。
+    #
+    # 填上之后改用 `launch_persistent_context`：Cookie / localStorage 落盘，
+    # 下一次运行还在 —— 需要登录的站点就变成"人登一次，之后不用再登"。
+    #
+    # ⚠️ 三条代价（完整取舍在 browser.BrowserSession.__aenter__ 里）：
+    #   1. 登录态长期留在磁盘上 = 凭据落在了本机，只该本机用、别共享、别进仓库；
+    #   2. 复用真实配置会让反自动化站点拦得更狠；
+    #   3. 一个目录同时只能给一个运行用（并发跑任务会互相抢）。
+    #
+    # 所以**默认关闭**：要用的人自己填路径，知道自己接受了什么。
+    persistent_profile_dir: str = field(
+        default_factory=lambda: _get("PERSISTENT_PROFILE_DIR")
+    )
+
     # 遇到登录墙时，等人登录的最长时间（秒）。
     #
     # 为什么必须有个上限：登录交接是**阻塞**的 —— 引擎在等人的时候不会往下走。

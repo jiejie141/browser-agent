@@ -68,6 +68,7 @@ from .agent import (
     _action_signature,
     login_blocked_warning,
     page_blocked_warning,
+    captcha_blocked_warning,
     loop_counts,
     oscillation_pages,
     oscillation_warning,
@@ -344,8 +345,12 @@ class LangGraphReActAgent:
         # 具体判据与实测过程见 agent.py 的 BLANK_STRIKES 与 page_blocked_warning。
         blank_hits = state.get("blank_hits", 0) + (1 if st.is_blank_page else 0)
         out_handoff_tried = state.get("handoff_tried", False)
+        # 与手写引擎同一套优先级：验证码 > 登录墙 > 空白页。
+        # 理由见 agent.py 同位置 —— 验证码是最具体的解释，而且人能立刻解决。
         blocked_reason = ""
-        if st.is_login_wall:
+        if st.is_captcha:
+            blocked_reason = st.captcha_reason
+        elif st.is_login_wall:
             blocked_reason = st.login_reason
         elif blank_hits >= BLANK_STRIKES:
             blocked_reason = st.blank_reason
@@ -357,13 +362,16 @@ class LangGraphReActAgent:
                 out_handoff_tried = True
                 landing = st.url
                 hopeless = ""
+                # 验证码**不能**跳走再叫人：它就在当前这一页上，
+                # 跳到站点首页反而把要滑的那个滑块弄没了。
+                skip_renavigate = st.is_captcha
                 # 空白页触发时先换到站点首页，**但必须确认那一页真的能用** ——
                 # 实测 BOSS直聘 在有头模式下载入首页 2 秒后仍会自己跳回
                 # about:blank（页内 browser-check-v2.js），人在那种窗口里也登不了。
                 # 换过去还是空白 → 不要弹"请去登录"，那是在骗人。
                 # 详细说明见 agent.py 同位置。
-                if st.is_blank_page and self.pre_login_url \
-                        and self.pre_login_url != st.url:
+                if st.is_blank_page and not skip_renavigate \
+                        and self.pre_login_url and self.pre_login_url != st.url:
                     await session.execute(Action(action="goto", url=self.pre_login_url))
                     landing = (session.page.url if session.page else "") or self.pre_login_url
                     # 必须等一会儿再复采：站点可能是"先渲染、2 秒后自毁"，
@@ -387,12 +395,21 @@ class LangGraphReActAgent:
                     except Exception as exc:
                         log.warning("登录交接失败，按未登录处理: %s", exc)
                 if resumed:
-                    await session.execute(
-                        Action(action="goto", url=state.get("start_url", ""))
-                    )
+                    # 验证码不重开页面：它就在当前页上，跳走会把刚滑完才通过
+                    # 的那次验证作废（重新加载 = 重新校验）。登录才需要回任务入口。
+                    if skip_renavigate:
+                        tail = "，留在当前页面继续"
+                    else:
+                        await session.execute(
+                            Action(action="goto", url=state.get("start_url", ""))
+                        )
+                        tail = f"，回到任务入口 {state.get('start_url', '')}"
+                    headline = "人已完成验证码" if st.is_captcha else "已完成登录"
                     rec = StepRecord(
-                        step=step, action=None, raw_action="登录交接", ok=True,
-                        message=f"已完成登录，回到任务入口 {state.get('start_url', '')}",
+                        step=step, action=None,
+                        raw_action="验证码交接" if st.is_captcha else "登录交接",
+                        ok=True,
+                        message=f"{headline}{tail}",
                         url_after=session.page.url if session.page else "",
                     ).model_dump()
                     return {
@@ -413,20 +430,27 @@ class LangGraphReActAgent:
                         "records": list(state.get("records") or []) + [rec],
                         "history": _note(
                             state,
-                            f"第 {step} 步: 登录已完成，已重新打开任务入口。"
-                            f"现在去找内容 —— 顺序是**先登录后找内容**，不要反过来。",
+                            f"第 {step} 步: {headline}{tail}。"
+                            + (
+                                "现在继续往下做 —— **不要**再去碰验证码控件。"
+                                if st.is_captcha
+                                else
+                                "现在去找内容 —— 顺序是**先登录后找内容**，不要反过来。"
+                            ),
                         ),
                     }
 
             notified_at = state.get("login_notified_at", 0)
             # 与手写引擎一致：`0` 表示"还没提醒过"，第一次必须提醒，不能节流掉。
             if notified_at == 0 or step - notified_at >= LOGIN_NOTIFY_EVERY:
-                # 两种拦截的措辞不能混用（指错方向比不说更糟）。
-                history.append(
-                    login_blocked_warning(blocked_reason)
-                    if st.is_login_wall
-                    else page_blocked_warning(blocked_reason)
-                )
+                # 三种拦截的措辞不能混用（指错方向比不说更糟）：
+                # 验证码 = 别再点滑块 / 登录墙 = 别横跳 / 空白页 = 别拿空白当证据。
+                if st.is_captcha:
+                    history.append(captcha_blocked_warning(blocked_reason))
+                elif st.is_login_wall:
+                    history.append(login_blocked_warning(blocked_reason))
+                else:
+                    history.append(page_blocked_warning(blocked_reason))
                 out_login_at = step
             else:
                 out_login_at = state.get("login_notified_at", 0)

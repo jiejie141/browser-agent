@@ -311,12 +311,14 @@ code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); paddi
         <span class="badge idle" id="vb">—</span>
         <span class="pill" id="vtid" style="display:none"></span>
       </div>
+      <!-- 这个框**不只是给登录用的**：撞到验证码时走的也是同一条交接通道
+           （引擎解不了滑块，只能叫人）。所以标题和按钮都不写死"登录"。 -->
       <div class="loginbox" id="loginbox">
-        <div><b>这个站点需要登录</b> —— 顺序是「先登录，再找内容」。</div>
+        <div><b id="logintitle">这一步需要你来操作</b> —— 顺序是「先处理掉它，再找内容」。</div>
         <div class="hint" id="loginhint"></div>
         <div class="row">
-          <button class="btn btn-primary" id="logindone">我已完成登录，继续</button>
-          <button class="btn" id="logincancel">放弃登录</button>
+          <button class="btn btn-primary" id="logindone">我已完成，继续</button>
+          <button class="btn" id="logincancel">放弃，让 Agent 收尾</button>
         </div>
       </div>
       <div class="answer" id="ans" style="display:none"></div>
@@ -480,7 +482,11 @@ function paint(t){
   const waiting = t.status === 'waiting_login';
   if(waiting || hint){
     lb.style.display = '';
-    $('#loginhint').textContent = hint || '请在浏览器窗口里完成登录。';
+    $('#loginhint').textContent = hint || '请在浏览器窗口里处理它。';
+    // 标题跟着交接的种类变：验证码和登录是两件不同的事，
+    // 让人看着"请去登录"去滑一个滑块，是会让人愣住的。
+    $('#logintitle').textContent = /验证码|人机验证|人机校验|滑块/.test(hint)
+      ? '这一步要你完成一个验证码' : '这个站点需要登录';
     const btns = waiting ? '' : 'none';
     $('#logindone').style.display = btns;
     $('#logincancel').style.display = btns;

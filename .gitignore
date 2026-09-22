@@ -19,6 +19,12 @@ __pycache__/
 runs/*
 !runs/.gitkeep
 
+# ---- 浏览器持久化目录 ----
+# PERSISTENT_PROFILE_DIR 指向的目录里存着**登录态**（Cookie / localStorage），
+# 等于把账号凭据放在磁盘上。它绝不能进版本库 —— 而且只该指向本机目录。
+.browser-profile/
+browser-profile/
+
 # ---- 编辑器 ----
 .idea/
 *.swp
