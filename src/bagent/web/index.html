@@ -295,6 +295,13 @@ code{font-family:var(--mono); font-size:11.5px; background:var(--panel-2); paddi
           <div class="f">
             <label class="chk"><input type="checkbox" id="mock"> 离线替身（不调真实模型、不花钱）</label>
           </div>
+          <div class="f">
+            <!-- 默认**勾上**：本地开发用控制台，看得见浏览器才有意义，
+                而且遇到登录墙时"人工登录"这条路的**前提就是有一个窗口**。
+                无头模式下交接只能被诚实地拒绝（见 api._login_handoff），
+                所以默认给窗口，需要省资源时再取消勾选。 -->
+            <label class="chk"><input type="checkbox" id="headful" checked> 显示浏览器窗口（需要登录时用得上）</label>
+          </div>
         <button class="btn btn-primary" id="go" style="width:100%">▶ 开始执行</button>
       </div>
     </div>
@@ -351,6 +358,11 @@ const api = (p, o) => fetch(p, o).then(async r => {
   return j;
 });
 let cur = null, timer = null;
+/* 上一次「选站 + 关键词」的解析结果。提交时要靠它把 requires_login / login_url
+   带给服务端（见 #go 的回调）。
+   ⚠️ 用户一旦手改了任务或网址，这份解析结果就作废了 —— 否则换成一个完全
+   不相干的任务时，会莫名其妙地按"上一个站点需要登录"来处理。 */
+let lastResolve = null;
 
 /* ---- 健康检查 + 引擎列表 ---- */
 async function boot(){
@@ -383,6 +395,17 @@ $('#go').onclick = async () => {
   const body = { task, url, mock: $('#mock').checked };
   const eng = $('#engine').value; if(eng) body.engine = eng;
   const ms = parseInt($('#ms').value, 10); if(ms > 0) body.max_steps = ms;
+  // 勾了"显示浏览器窗口" → headless=false。服务端据此起有头浏览器，
+  // 这样**任何**任务（包括手动填的登录网址）都能走人工登录交接，
+  // 而不是只有注册表里标了 needs_login 的站点才行。
+  body.headless = !$('#headful').checked;
+  // 把"这个站已知要登录"这份知识**交给服务端**，而不是只在本页显示一个警告角标。
+  // 只显示不传递，就是知道了却不用 —— 实测的后果是：Agent 拿着一个必然被拦的
+  // 搜索网址开跑，被拦后又识别不出来（页面已变成 about:blank），最后报"无法完成"。
+  if(lastResolve && lastResolve.needs_login){
+    body.requires_login = true;
+    if(lastResolve.login_url) body.login_url = lastResolve.login_url;
+  }
 
   $('#go').disabled = true; $('#go').textContent = '提交中…';
   $('#err').innerHTML = ''; $('#steps').innerHTML = '';
@@ -446,10 +469,21 @@ function paint(t){
   const [cls, txt] = BADGE[t.status] || ['idle', t.status];
   // 等待登录时必须把"该你干活了"说清楚：只转圈的话，
   // 使用者不知道是自己该登录，只会以为卡住了。
+  //
+  // 2026-09-22 追加：**交接失败的原因也要显示出来**。原先只在
+  // status === 'waiting_login' 时显示这个框，于是"无头模式没法登录"
+  // "等待登录超时"这两种失败提示被静默吞掉了 —— 使用者只看到任务失败，
+  // 不知道改一个环境变量就能解决。现在只要 login_hint 非空就显示，
+  // 但**只有真的在等登录时才给按钮**（否则点了也没意义）。
   const lb = $('#loginbox');
-  if(t.status === 'waiting_login'){
+  const hint = t.login_hint || '';
+  const waiting = t.status === 'waiting_login';
+  if(waiting || hint){
     lb.style.display = '';
-    $('#loginhint').textContent = t.login_hint || '请在浏览器窗口里完成登录。';
+    $('#loginhint').textContent = hint || '请在浏览器窗口里完成登录。';
+    const btns = waiting ? '' : 'none';
+    $('#logindone').style.display = btns;
+    $('#logincancel').style.display = btns;
   } else {
     lb.style.display = 'none';
   }
@@ -600,6 +634,8 @@ async function goSearch(){
     });
     $('#task').value = r.task;
     $('#url').value = r.url;
+    // 程序化赋值不会触发 input 事件，所以这里要在赋值**之后**才记下来。
+    lastResolve = r;
     $('#taskhint').innerHTML = r.needs_login
       ? `<span class="warn">⚠ ${esc(r.warning)}</span>`
       : `<span class="good">✓ 已解析</span> <code>${esc(r.url)}</code>`;
@@ -615,6 +651,10 @@ async function goSearch(){
 
 $('#gosearch').onclick = goSearch;
 $('#site').onchange = onSiteChange;
+// 手改任务或网址 → 上一次的解析结果作废（否则会把"上一个站点要登录"
+// 这件事错用到新任务上）。
+$('#task').addEventListener('input', () => { lastResolve = null; });
+$('#url').addEventListener('input', () => { lastResolve = null; });
 $('#kw').addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); goSearch(); } });
 
 $('#mock').addEventListener('change', () => {

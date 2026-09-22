@@ -76,6 +76,35 @@ class TaskRequest(BaseModel):
     engine: str | None = Field(
         None, description="引擎：handwritten（默认）/ langgraph"
     )
+    # 是否无头运行。`false` = 显示浏览器窗口。
+    #
+    # 为什么让请求方来决定：本地控制台的使用者需要**看得见**浏览器 ——
+    # 不只是为了"看着放心"，而是"人工登录"这条路的前提就是有一个窗口
+    # （无头模式下 `_login_handoff` 只能诚实地拒绝，见那里的说明）。
+    # 留 None = 用 .env 的 HEADLESS（服务器/容器里保持无头）。
+    headless: bool | None = Field(
+        None, description="false = 显示浏览器窗口（人工登录时需要）"
+    )
+    # 站点注册表里 `Site.needs_login` 的知识，**必须传进来**。
+    #
+    # 这补的是一个真实漏洞（2026-09-22 用户实测 BOSS直聘 时暴露的）：
+    # 注册表早就写着 `needs_login=True, note="首页可读；搜索页要求登录"`，
+    # `/resolve` 也把它返回给前端了 —— 但前端只拿它渲染了一个 ⚠ 角标，
+    # **Agent 自己完全不知道**。于是它老老实实带着一个必然被拦的搜索网址开跑，
+    # 被拦之后又检测不出来（那时页面已经变成 about:blank），最后只能报"无法完成"。
+    # 知识就在系统里，却没有流到需要它的地方 —— 这类缺陷比"没做"更难发现。
+    #
+    # 语义是**提示**不是命令：它只让引擎提前用有头模式起浏览器、
+    # 并知道登录该落在哪个页面；**要不要真的交接仍然由页面证据决定**
+    # （看 is_login_wall / 空白页），所以已登录状态下不会白打扰人一次。
+    requires_login: bool = Field(
+        False, description="已知该站点的目标页需要登录（来自站点注册表）"
+    )
+    # 真人能完成登录的落点，通常是站点首页。交接前引擎会先导航到这里 ——
+    # 被拦时当前页可能已经是 about:blank，把空白页交给人等于空转。
+    login_url: str | None = Field(
+        None, description="需要人工登录时先打开的页面（通常是站点首页）"
+    )
 
 
 class StepOut(BaseModel):
@@ -226,8 +255,14 @@ def resolve(req: ResolveRequest) -> dict[str, Any]:
         # needs_login 要如实回传：前端据此把按钮标成"可能进不去"。
         # 隐瞒它等于让用户点下去才发现被拦，那是把项目的短板藏在用户脚下。
         "needs_login": s.needs_login,
+        # 而且要**顺手把这份知识送到能用它的地方**：前端把 login_url 与
+        # needs_login 一起提交给 /tasks，服务端据此改用有头模式、并在交接时
+        # 先把浏览器开到首页。只回传不传递，等于知道了却不用 ——
+        # BOSS直聘 那次就是这么白跑一趟的（详见 TaskRequest.requires_login）。
+        "login_url": s.home if s.needs_login else None,
         "warning": (
-            f"{s.name} 的搜索页需要登录或有验证，任务可能被安全护栏拦下。"
+            f"{s.name} 的搜索页需要登录。任务会先打开站点首页，"
+            f"让你在浏览器窗口里完成登录，登录后自动继续找内容。"
             if s.needs_login
             else ""
         ),
@@ -365,6 +400,20 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
     # 离线任务会照常乘单价算出个假成本（实测 ¥0.00347），
     # 而界面上又标着"不花钱" —— 一个开关两处读，迟早对不上。
     st.mock = bool(req.mock)
+    # 请求方明确要求有窗口（控制台默认勾上）→ 起有头浏览器。
+    # 这是"人工登录"能成立的前提：没有窗口，交接就只能被拒绝。
+    if req.headless is False:
+        st.headless = False
+    # 已知目标页要登录 → **本次运行必须有可见窗口**，否则交接是空头支票。
+    #
+    # 这修的是一个自相矛盾：`_login_handoff` 的提示写着"请在浏览器窗口里完成登录"，
+    # 而 `HEADLESS=True`（默认）下**根本不存在那个窗口** —— 提示在骗人，
+    # 使用者点了"登录完成"也没登录过任何东西。现在按需转为有头模式：
+    # 注册表说这个站要登录，就给一个真窗口。
+    if req.requires_login and not req.mock:
+        if st.headless:
+            log.info("任务 %s 目标站点需要登录 → 本次运行改用有头模式", tid)
+        st.headless = False
 
     def on_step(step: int, action, ok: bool, message: str) -> None:
         """把每一步**增量**写进任务表。
@@ -398,6 +447,21 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
         ev = t["_login_event"]
         ev.clear()
         t["_login_aborted"] = False
+        # 无头模式没有窗口，人在里面无处可点 —— 此时**必须诚实地拒绝交接**，
+        # 而不是挂起 300 秒等一个永远不可能发生的点击。
+        # 走到这一支说明这是"跑到一半才发现"的未知站点（已知要登录的站点
+        # 在 _run_task 里已经把 st.headless 关掉了，见那里的说明）。
+        if st.headless:
+            # 这里刻意把提示留在 login_hint 上（不清空）：交接失败的原因必须
+            # 让人看得见，否则使用者只会看到任务莫名其妙地失败，
+            # 不知道"改一个环境变量就能解决"。
+            t["login_hint"] = (
+                f"⚠ {reason}。但本服务当前是**无头模式**，没有浏览器窗口可供你登录。"
+                f"请把 .env 里的 HEADLESS 改成 false 后重试（或在桌面用启动器起服务）。"
+                f"当前页: {url}"
+            )
+            log.warning("任务 %s 需要人工登录，但当前是无头模式，无法交接", tid)
+            return False
         t["status"] = "waiting_login"
         t["login_hint"] = (
             f"{reason}。请在浏览器窗口里完成登录，然后点「登录完成，继续」；"
@@ -408,12 +472,21 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
         except asyncio.TimeoutError:
             log.warning("任务 %s 等待登录超时（%.0fs），按未登录处理",
                         tid, st.login_wait_seconds)
+            # 超时也不能把原因清掉 —— 使用者需要知道"是我没来得及登"，
+            # 而不是"这个任务就是做不了"。
+            t["login_hint"] = (
+                f"⚠ 等待人工登录超时（{st.login_wait_seconds:.0f} 秒），"
+                f"已按「未登录」继续。原因：{reason}"
+            )
             return False
         finally:
             if t.get("status") == "waiting_login":
                 t["status"] = "running"
-            t["login_hint"] = ""
-        return not bool(t.get("_login_aborted"))
+        aborted = bool(t.get("_login_aborted"))
+        t["login_hint"] = (
+            f"⚠ 你选择了放弃登录，已按「未登录」继续。原因：{reason}" if aborted else ""
+        )
+        return not aborted
 
     cm = None
     try:
@@ -439,6 +512,9 @@ async def _run_task(tid: str, req: TaskRequest, engine: str) -> None:
             max_steps=req.max_steps,
             # mock 模式下不交接登录：离线替身没有真实浏览器窗口可看
             login_handoff=None if req.mock else _login_handoff,
+            # 交接时把浏览器导航到哪里 —— 注册表给的站点首页。
+            # 没有它的话，BOSS直聘 那种被拦成 about:blank 的情况会把空白页交给人。
+            pre_login_url=req.login_url,
         )
 
         t.update({

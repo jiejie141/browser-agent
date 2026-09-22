@@ -156,6 +156,14 @@ class PageState(BaseModel):
     # 里 detect_login_wall 的说明）。
     is_login_wall: bool = False
     login_reason: str = ""
+    # 这一帧是不是**被清空的空白页**。
+    #
+    # 与 is_login_wall 并列但**不是一回事**：那个是"页面把你挡在登录页前"，
+    # 这个是"页面整个没了"（实测 BOSS直聘 的人机校验会把人踢到 about:blank，
+    # 整页只剩 3 个节点）。两个事实的处置相同 —— 交给人 —— 但理由必须分开写，
+    # 否则给模型的提示会指错方向（"去登录"vs"页面被清空了，先别急着下结论"）。
+    is_blank_page: bool = False
+    blank_reason: str = ""
 
     def render_for_prompt(self, max_body_chars: int = 3000) -> str:
         """渲染成给模型看的纯文本。控制长度就是控制成本。
@@ -210,6 +218,23 @@ class PageState(BaseModel):
                 "**登录成功之后**再去找内容 —— 不要反过来。",
                 "如果无法登录，就直接 finish 说明「需要登录，无法完成」，"
                 "这类结论免检 evidence。",
+            ]
+
+        if self.is_blank_page:
+            # 这一支是给"空白页"的。**必须如实报出真实网址** ——
+            # 实测模型在空白页上会自己"补"出一个像模像样的登录网址
+            # （BOSS直聘那次它报了 /web/user/，而导航记录里从来没出现过）。
+            # 直接把观测到的地址摆出来，是唯一能压住这种编造的办法。
+            lines += [
+                "",
+                f"⚠ 当前是**空白页**（判定依据：{self.blank_reason}）。",
+                f"真实观测到的地址就是「{self.url or 'about:blank'}」，"
+                "**不要凭印象猜测或编造别的网址**。",
+                "这通常是站点的人机校验/登录拦截把页面清掉了，"
+                "「什么都没有」不等于「网站上没有这份内容」——"
+                "**不要据此下「内容不存在」的结论**。",
+                "先试着重新打开任务要求的起始网址；如果再次变成空白页，"
+                "就 finish 说明「站点拦截了自动访问，需要人工处理」。",
             ]
 
         body = (self.body_text or "").strip()

@@ -38,6 +38,7 @@ LangGraph 引擎是**并行的第二条实现**，用来证明同一套抽象换
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -47,7 +48,9 @@ from typing import Annotated, Awaitable, Callable, Literal, TypedDict
 import logging
 
 from .agent import (
+    BLANK_STRIKES,
     CLOSING_MAX_STEPS,
+    HOSTILE_SETTLE_SECONDS,
     LOOP_STOP_AT,
     LOOP_WARN_AT,
     MAX_CONSECUTIVE_FAILURES,
@@ -64,6 +67,7 @@ from .agent import (
     StepCallback,
     _action_signature,
     login_blocked_warning,
+    page_blocked_warning,
     loop_counts,
     oscillation_pages,
     oscillation_warning,
@@ -182,6 +186,12 @@ class AgentState(TypedDict, total=False):
     login_done: bool
     login_notified_at: int
     just_logged_in: bool
+    # 已看到过几次"被清空的空白页"。累计值，判据见 agent.BLANK_STRIKES。
+    # 必须在图里显式声明：**未声明的键 LangGraph 会直接丢掉**（这个坑上面记过两次）。
+    blank_hits: int
+    # 登录交接**是否已经问过人**（不论成没成）。只看 login_done 会让
+    # "放弃登录"之后每一步都再问一遍 —— 详见 perceive 节点里的说明。
+    handoff_tried: bool
     # reason 节点解析失败时，模型**原始输出**的文本。必须声明才能在节点间
     # 传到 act（未声明的键 LangGraph 会直接丢掉 —— 上面已经踩过两次）。
     # act 节点靠它把原文写进 StepRecord.raw_output。
@@ -255,6 +265,9 @@ class LangGraphReActAgent:
         self.llm = llm or build_client(settings)
         self.on_step = on_step
         self.login_handoff: LoginHandoff | None = None
+        # 真人能完成登录的落点（站点首页）。交接前先导航到这里 ——
+        # 当前页可能是 about:blank，交出空白页等于空转。理由见 agent.run 的文档。
+        self.pre_login_url: str | None = None
         # 与手写引擎一致：自己造视觉客户端并传给 perceive，
         # 否则 `vlm is not None` 恒为假，视觉描述这条降级路径等于没接。
         self.vlm: LLMClient | None = None
@@ -326,14 +339,53 @@ class LangGraphReActAgent:
         closing = state.get("closing", False)
         closing_steps = state.get("closing_steps", 0)
 
-        # ---------- 登录墙：先登录，再找内容（与手写引擎同一套语义）----------
+        # ---------- 被挡住：先登录，再找内容（与手写引擎同一套语义）----------
+        # 两个触发源，处置相同、理由分开：登录墙 / 累计 2 帧空白页。
+        # 具体判据与实测过程见 agent.py 的 BLANK_STRIKES 与 page_blocked_warning。
+        blank_hits = state.get("blank_hits", 0) + (1 if st.is_blank_page else 0)
+        out_handoff_tried = state.get("handoff_tried", False)
+        blocked_reason = ""
         if st.is_login_wall:
-            if not state.get("login_done") and self.login_handoff is not None:
-                resumed = False
-                try:
-                    resumed = await self.login_handoff(st.url, st.login_reason)
-                except Exception as exc:
-                    log.warning("登录交接失败，按未登录处理: %s", exc)
+            blocked_reason = st.login_reason
+        elif blank_hits >= BLANK_STRIKES:
+            blocked_reason = st.blank_reason
+
+        if blocked_reason:
+            # 只看 `login_done` 是不够的：它只在交接**成功**时才置位，
+            # 于是人点"放弃登录"之后每一步都会再问一遍。判据改成"问过没有"。
+            if not state.get("handoff_tried") and self.login_handoff is not None:
+                out_handoff_tried = True
+                landing = st.url
+                hopeless = ""
+                # 空白页触发时先换到站点首页，**但必须确认那一页真的能用** ——
+                # 实测 BOSS直聘 在有头模式下载入首页 2 秒后仍会自己跳回
+                # about:blank（页内 browser-check-v2.js），人在那种窗口里也登不了。
+                # 换过去还是空白 → 不要弹"请去登录"，那是在骗人。
+                # 详细说明见 agent.py 同位置。
+                if st.is_blank_page and self.pre_login_url \
+                        and self.pre_login_url != st.url:
+                    await session.execute(Action(action="goto", url=self.pre_login_url))
+                    landing = (session.page.url if session.page else "") or self.pre_login_url
+                    # 必须等一会儿再复采：站点可能是"先渲染、2 秒后自毁"，
+                    # goto 一返回就采样会采到它还活着的那一瞬间。见 HOSTILE_SETTLE_SECONDS。
+                    await asyncio.sleep(HOSTILE_SETTLE_SECONDS)
+                    retry = await perceive(
+                        session.page, self.settings, step=step,
+                        run_dir=self._run_dir, vlm=self.vlm,
+                    )
+                    if retry.is_blank_page:
+                        hopeless = (
+                            f"连站点首页也变成了空白页（{retry.url}）——"
+                            f"该站点在阻止自动化访问，人工登录也解决不了"
+                        )
+                if hopeless:
+                    blocked_reason = hopeless
+                else:
+                    resumed = False
+                    try:
+                        resumed = await self.login_handoff(landing, blocked_reason)
+                    except Exception as exc:
+                        log.warning("登录交接失败，按未登录处理: %s", exc)
                 if resumed:
                     await session.execute(
                         Action(action="goto", url=state.get("start_url", ""))
@@ -346,6 +398,9 @@ class LangGraphReActAgent:
                     return {
                         "login_done": True,
                         "just_logged_in": True,
+                        "handoff_tried": True,
+                        # 登录后重新计数：旧的那几帧空白页不再代表"现在还被拦着"。
+                        "blank_hits": 0,
                         # 清空所有基于"登录前页面"的判据状态，
                         # 否则刚登录就被旧指纹判成"又在振荡"。
                         "fp_history": [],
@@ -366,7 +421,12 @@ class LangGraphReActAgent:
             notified_at = state.get("login_notified_at", 0)
             # 与手写引擎一致：`0` 表示"还没提醒过"，第一次必须提醒，不能节流掉。
             if notified_at == 0 or step - notified_at >= LOGIN_NOTIFY_EVERY:
-                history.append(login_blocked_warning(st.login_reason))
+                # 两种拦截的措辞不能混用（指错方向比不说更糟）。
+                history.append(
+                    login_blocked_warning(blocked_reason)
+                    if st.is_login_wall
+                    else page_blocked_warning(blocked_reason)
+                )
                 out_login_at = step
             else:
                 out_login_at = state.get("login_notified_at", 0)
@@ -429,6 +489,10 @@ class LangGraphReActAgent:
             "osc_notified_at": osc_notified_at,
             "osc_pages": osc_warned,
             "login_notified_at": out_login_at,
+            "blank_hits": blank_hits,
+            # 必须回写：不回写的话下一次 perceive 读到的还是 False，
+            # 又变成"每一步问一遍"。这个键是持久化在图状态里的。
+            "handoff_tried": out_handoff_tried,
             # 正常路径一定要把它写回 False：否则下次路由还会再"重新感知"一次，
             # 形成 perceive → perceive 的自环。
             "just_logged_in": False,
@@ -699,10 +763,12 @@ class LangGraphReActAgent:
         confirm: Callable[[str], Awaitable[bool]] | None = None,
         max_steps: int | None = None,
         login_handoff: LoginHandoff | None = None,
+        pre_login_url: str | None = None,
     ) -> RunResult:
         # 登录交接是**每次运行**的入参（不是构造参数）：谁能登录、怎么登录
         # 由调用方决定，引擎只认"返回 True 表示已登录"这个契约。
         self.login_handoff = login_handoff
+        self.pre_login_url = pre_login_url
         max_steps = max_steps or self.settings.max_steps
         started = time.time()
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -742,6 +808,15 @@ class LangGraphReActAgent:
                 "grounded": False,
                 "grounding_note": "",
                 "grounding_retries": 0,
+                # 登录 / 拦截相关初值。这些键即使不写也能跑（节点里都是 .get() 带默认值），
+                # 但显式写出来才能让"图的状态契约"一眼看全 ——
+                # 之前已经因为"忘了声明状态键"踩过两次静默丢数据。
+                "login_done": False,
+                "login_notified_at": 0,
+                "just_logged_in": False,
+                "blank_hits": 0,
+                "handoff_tried": False,
+                "raw_output": "",
             }
         )
 

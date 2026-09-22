@@ -348,6 +348,52 @@ def detect_login_wall(
 
 _HAS_PASSWORD_JS = "() => document.querySelectorAll('input[type=password]').length > 0"
 
+# "没有页面"的几种写法。about:srcdoc 是 iframe 内联文档被单独导航时的产物，
+# 同样意味着"主文档已经不在我们手里了"。
+_BLANK_URLS = ("about:blank", "about:srcdoc", "")
+
+
+def detect_blank_page(
+    url: str = "",
+    title: str = "",
+    body_text: str = "",
+    *,
+    element_count: int = 0,
+) -> tuple[bool, str]:
+    """这一帧是不是**被清空的空白页**（什么都没渲染出来）。纯函数，可离线单测。
+
+    ## 为什么这值得单独判一次（实测证据，不是假想）
+
+    2026-09-22 用户拿 BOSS直聘 试搜索页，结果是"无法完成任务"。抓了导航事件
+    才看清真实过程 —— 它根本不是"跳到登录页"，而是一个**人机校验跳转循环**：
+
+        /web/geek/job?...          → "加载中，请稍候"
+        /web/geek/jobs?...&_security_check=1_...   → 渲染出 1186 个节点（有"登录"入口）
+        /web/passport/zp/security.html?code=37...  → 人机校验页
+        about:blank  ← 来回跳若干次后停在这里，整页只剩 **3 个节点 / 39 字节**
+
+    停在空白页时，`detect_login_wall` 的**三个信号全灭**：网址是 about:blank
+    不像登录、没有文案、没有密码框。于是模型看到的是"一个什么都没有的页面"，
+    只能给出"无法完成"。可这个状态的真实含义是**"被挡在门外了"**，不是"没内容"。
+
+    所以这里做一件事：把"空白"本身当成一条**独立证据**报上去，
+    让上层有机会把它交给人处理，而不是让模型对着空白页硬编理由。
+
+    ⚠️ 单帧空白**不算数**：页面正常加载的中间态也会是空的（实测 SPA 在
+    domcontentloaded 时正文只有 7 个字"加载中，请稍候"）。
+    所以这里只负责"这一帧是不是空白"，**连续两帧空白**这个条件由引擎侧
+    状态机来判（见 agent.py 的 `blank_streak`）——
+    感知层是无状态的，把时序判据塞进来会让它没法纯函数单测。
+    """
+    u = (url or "").strip().lower()
+    if u not in _BLANK_URLS:
+        return False, ""
+    if (body_text or "").strip():
+        return False, ""
+    if element_count > 0:
+        return False, ""
+    return True, f"页面已变成空白页（{url or 'about:blank'}），正文与可交互元素都为空"
+
 
 def _looks_maybe_login(url: str, title: str, body_text: str) -> bool:
     """网址或文案**有那么一点像**登录页 —— 用来决定要不要去查密码框。
@@ -415,6 +461,11 @@ async def perceive(
     is_wall, wall_reason = detect_login_wall(
         url, title, body_text, has_password_field=has_pwd
     )
+    # "被清成空白页"与"被登录墙挡住"是两件不同的事实，但处置相同：
+    # 都交给人来处理（详见 detect_blank_page 里的实测过程）。
+    is_blank, blank_reason = detect_blank_page(
+        url, title, body_text, element_count=len(elements)
+    )
 
     state = PageState(
         step=step,
@@ -424,6 +475,8 @@ async def perceive(
         body_text=body_text,
         is_login_wall=is_wall,
         login_reason=wall_reason,
+        is_blank_page=is_blank,
+        blank_reason=blank_reason,
     )
 
     if need_vision:

@@ -17,6 +17,7 @@ Agent 会看到变化并自己绕路。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -421,6 +422,48 @@ def trim_history(history: list[str]) -> list[str]:
 # 模型不听的时候，每一步都背一段越来越长的话，prompt 迅速膨胀。
 LOGIN_NOTIFY_EVERY = 4
 
+# 看到几次"空白页"才认定是被站点拦住了。
+#
+# 为什么是**累计 2 次**而不是"连续 2 次"：我们要防的是"加载中间态被误判"，
+# 而中间态的问题是"看一眼不算数"，不是"中间隔了一帧就不算数"。
+# 实测 SPA 加载会先出现"加载中，请稍候"这种非空白帧，再变空白 ——
+# 如果按"连续"计，那一次 retry 就被中间的加载帧抹掉了，判定要再等一轮，
+# 白白多烧几步。按累计计，语义正好是"看过一次是空的，重开一次还是空的"，
+# 也就是"retry 没用"这个我们真正想知道的结论。
+BLANK_STRIKES = 2
+
+# 「落地页到底稳不稳」的观察窗口（秒）。
+#
+# 为什么需要它（实测，不是拍的）：BOSS直聘 的首页先正常渲染出 6399 个节点，
+# 约 **2 秒后**才由页内的 browser-check-v2.js 把自己跳成 about:blank。
+# 所以"换到首页 → 立刻看一眼 → 还在 → 判定可用"是错的：
+# 采到的是它还活着的那一瞬间。人一到窗口前页面已经没了，比不叫更糟。
+# 3 秒 > 实测的 2 秒，留一秒余量。
+#
+# 代价：只在"被拦截且触发交接"这条罕见路径上多花 3 秒，可以接受。
+HOSTILE_SETTLE_SECONDS = 3.0
+
+
+def page_blocked_warning(reason: str) -> str:
+    """「页面被清空了，而且没人能来处理」时的注入文本。
+
+    与 `login_blocked_warning` 的关键差别：那个说"你没凭据、别横跳"，
+    这个说"**什么都看不见不等于内容不存在**" ——
+    实测模型会拿空白页当证据下"任务无法完成"的结论，甚至编出一个
+    根本没出现过的登录网址（BOSS直聘那次它报了 `/web/user/`，
+    导航记录里从来没有这个地址）。
+    """
+    return (
+        f"⚠ 当前页面已被清空为空白页（{reason}）。\n"
+        "**空白不等于内容不存在** —— 这是站点的拦截行为，不是你判断"
+        "「网站上没有这份内容」的证据。\n"
+        "你现在的选择只有两个：\n"
+        "  (a) 用 goto 重新打开任务要求的起始网址，再确认一次；\n"
+        "  (b) 如果重新打开后仍然是空白页，立刻 finish，"
+        "在 answer 里写明「站点拦截了自动访问，需要人工处理」。\n"
+        "**不要**编造你并没有观测到的网址，也不要凭印象猜重定向去了哪里。"
+    )
+
 
 def login_blocked_warning(reason: str) -> str:
     """「这是登录墙，而且没人能登录」时的注入文本。两个引擎共用一份。
@@ -520,6 +563,7 @@ class ReActAgent:
         confirm: Callable[[str], Awaitable[bool]] | None = None,
         max_steps: int | None = None,
         login_handoff: LoginHandoff | None = None,
+        pre_login_url: str | None = None,
     ) -> RunResult:
         """跑一个任务。
 
@@ -527,6 +571,14 @@ class ReActAgent:
         Agent 才能"先登录、再找内容"；不给（评测、无人值守的服务），
         遇到墙就走 `login_blocked_warning` 那套"体面停下"的逻辑 ——
         **绝不**假装登录过了。
+
+        `pre_login_url`：**真人能完成登录的落点**，通常是站点首页
+        （注册表里 `Site.home`）。只在需要交接时用得上：
+
+        实测教训 —— 光有 `login_handoff` 是不够的。BOSS直聘被拦后当前页
+        已经是 `about:blank` 了，把**空白页**交给人，人在那上面没有任何
+        东西可点，交接等于空转。所以交接前要先把浏览器导航到一个
+        真实存在、有登录入口的页面。
         """
         max_steps = max_steps or self.settings.max_steps
         started = time.time()
@@ -567,6 +619,17 @@ class ReActAgent:
         #   login_notified_at  —— 上一次"没人能登录"的提示是第几步（用于节流）
         login_done = False
         login_notified_at = 0
+        # 登录交接**是否已经问过人**（不论成没成）。
+        #
+        # ⚠️ 这一条修的是一个"测试写着却没真正生效"的性质：原来的守卫只看
+        # `login_done`，而它只在**交接成功**时才置位 —— 于是人点了"放弃登录"
+        # 之后，下一步遇到同一堵墙会**再问一遍**，每一步都问。
+        # 旧测试之所以没暴露它，是因为那次运行在第 1 步就 finish 了，
+        # 循环根本没走到第二次。现在无论成败都只问一次：
+        # 人已经明确表态过，再问就是打扰。
+        handoff_tried = False
+        # 已经看到过几次"空白页"。累计值（不是连续值），理由见 BLANK_STRIKES。
+        blank_hits = 0
 
         for step in range(1, max_steps + 1):
             # 本步有没有因为"振荡"给过提醒（写进轨迹，供事后核对）。
@@ -584,64 +647,122 @@ class ReActAgent:
             )
             prefer_vision = False
 
-            # ---------- 登录墙：先登录，再找内容 ----------
+            # ---------- 被挡住：先登录，再找内容 ----------
+            # 两个触发源，**处置相同、理由分开**：
+            #   is_login_wall        —— 页面把你挡在登录页前；
+            #   累计 2 帧空白页       —— 页面整个被清掉了（人机校验的典型结果）。
+            #
             # 放在所有循环判据之前，因为它是**更具体**的解释：
-            # "你在登录页和内容页之间来回"这件事，与其让振荡检测笼统地说
-            # "你在绕圈子"，不如直接说"你被登录墙挡住了、顺序还反了"。
+            # "你在两个页面之间来回"这件事，与其让振荡检测笼统地说"你在绕圈子"，
+            # 不如直接说"你被挡住了、顺序还反了"。
+            if state.is_blank_page:
+                blank_hits += 1
+            blocked_reason = ""
             if state.is_login_wall:
-                if not login_done and login_handoff is not None:
-                    resumed = False
-                    try:
-                        resumed = await login_handoff(state.url, state.login_reason)
-                    except Exception as exc:
-                        # 交接失败不能把任务带崩：视作"没登录成"，走下面的提示分支。
-                        log.warning("登录交接失败，按未登录处理: %s", exc)
-                    if resumed:
-                        login_done = True
-                        # 登录之后世界变了：清掉所有"基于旧页面"的判据状态。
-                        # 不清的后果很具体 —— 登录页↔内容页那几个旧指纹还在
-                        # fp_history 里，登录后第一步就会被判成"又在振荡"，
-                        # 把刚刚成功的登录又带偏回去。
-                        fp_history.clear()
-                        prev_fp = ""
-                        stall_count = 0
-                        closing, closing_steps = False, 0
-                        consecutive_failures = 0
-                        sig_trail.clear()
-                        last_action = None
-                        # 回到任务入口：登录之前打开的往往是登录页，
-                        # 只有重新打开起始网址，内容才真的在。
+                blocked_reason = state.login_reason
+            elif blank_hits >= BLANK_STRIKES:
+                blocked_reason = state.blank_reason
+
+            if blocked_reason:
+                if not handoff_tried and login_handoff is not None:
+                    # 无论最后成不成，"登录这件事"整个运行只处理一次。
+                    handoff_tried = True
+                    landing = state.url
+                    hopeless = ""
+                    # ⚠️ 空白页触发时，先挪到站点首页 —— **但必须确认那一页真的能用**。
+                    #
+                    # 为什么非要回头确认一次（实测教训，2026-09-22）：BOSS直聘 即使
+                    # 在**有头模式**下，首页渲染完 6399 个节点后，2 秒内仍会自己跳回
+                    # about:blank（页内 browser-check-v2.js 干的，还顺带探了本机端口）。
+                    # 这种站点卡的不是"登录"，是"不许自动化" —— 人在那个窗口里
+                    # 一样登不进去（页面已经没了）。
+                    # 所以：换过去还是空白 → 就不要弹"请去登录"，那是在骗人，
+                    # 直接按"站点阻止自动化"收场。
+                    if state.is_blank_page and pre_login_url \
+                            and pre_login_url != state.url:
                         await session.execute(
-                            Action(action="goto", url=start_url), confirm=confirm
+                            Action(action="goto", url=pre_login_url), confirm=confirm
                         )
-                        records.append(
-                            StepRecord(
-                                step=step, action=None, raw_action="登录交接",
-                                ok=True,
-                                message=f"已完成登录，回到任务入口 {start_url}",
-                                url_after=session.page.url if session.page else "",
-                                screenshot_path=state.screenshot_path,
-                                # 登录前那一帧的指纹（下面马上会清空历史）：
-                                # 留着它，复盘时才能看出"登录前后页面确实变了"。
-                                page_fp=page_fingerprint(state),
-                                stall_count=0, osc_pages=osc_warned,
+                        landing = (session.page.url if session.page else "") or pre_login_url
+                        # ⚠️ 必须**等一会儿再复采**，不能马上判。
+                        # 实测：BOSS直聘 首页先正常渲染出 6399 个节点，约 2 秒后
+                        # 才自己跳回 about:blank。goto 一返回就采样，采到的是
+                        # "还在"的那一瞬间，于是判定通过、把人叫来，
+                        # 人一到窗口前页面已经没了 —— 比不叫更糟。
+                        await asyncio.sleep(HOSTILE_SETTLE_SECONDS)
+                        retry = await perceive(
+                            session.page, self.settings, step=step,
+                            run_dir=run_dir, vlm=self.vlm,
+                        )
+                        if retry.is_blank_page:
+                            hopeless = (
+                                f"连站点首页也变成了空白页（{retry.url}）——"
+                                f"该站点在阻止自动化访问，人工登录也解决不了"
                             )
-                        )
-                        if self.on_step:
-                            self.on_step(step, None, True, "已完成登录，回到任务入口")
-                        history.append(
-                            f"第 {step} 步: 登录已完成，已重新打开任务入口 {start_url}。"
-                            f"现在按任务要求去找内容 —— 顺序是**先登录后找内容**，不要反过来。"
-                        )
-                        history = trim_history(history)
-                        continue
+                    if hopeless:
+                        blocked_reason = hopeless
+                    else:
+                        resumed = False
+                        try:
+                            resumed = await login_handoff(landing, blocked_reason)
+                        except Exception as exc:
+                            # 交接失败不能把任务带崩：视作"没登录成"，走下面的提示分支。
+                            log.warning("登录交接失败，按未登录处理: %s", exc)
+                        if resumed:
+                            login_done = True
+                            # 登录之后世界变了：清掉所有"基于旧页面"的判据状态。
+                            # 不清的后果很具体 —— 登录页↔内容页那几个旧指纹还在
+                            # fp_history 里，登录后第一步就会被判成"又在振荡"，
+                            # 把刚刚成功的登录又带偏回去。
+                            fp_history.clear()
+                            prev_fp = ""
+                            stall_count = 0
+                            closing, closing_steps = False, 0
+                            consecutive_failures = 0
+                            sig_trail.clear()
+                            last_action = None
+                            # 登录后重新计数：世界变了，之前那几帧空白页不再代表
+                            # "现在还是被拦着"，不该拿旧账去逼模型立刻收手。
+                            blank_hits = 0
+                            # 回到任务入口：登录之前打开的往往是登录页，
+                            # 只有重新打开起始网址，内容才真的在。
+                            await session.execute(
+                                Action(action="goto", url=start_url), confirm=confirm
+                            )
+                            records.append(
+                                StepRecord(
+                                    step=step, action=None, raw_action="登录交接",
+                                    ok=True,
+                                    message=f"已完成登录，回到任务入口 {start_url}",
+                                    url_after=session.page.url if session.page else "",
+                                    screenshot_path=state.screenshot_path,
+                                    # 登录前那一帧的指纹（下面马上会清空历史）：
+                                    # 留着它，复盘时才能看出"登录前后页面确实变了"。
+                                    page_fp=page_fingerprint(state),
+                                    stall_count=0, osc_pages=osc_warned,
+                                )
+                            )
+                            if self.on_step:
+                                self.on_step(step, None, True, "已完成登录，回到任务入口")
+                            history.append(
+                                f"第 {step} 步: 登录已完成，已重新打开任务入口 {start_url}。"
+                                f"现在按任务要求去找内容 —— 顺序是**先登录后找内容**，不要反过来。"
+                            )
+                            history = trim_history(history)
+                            continue
 
                 # 没有交接通道，或交接没成功 → 明确告诉它"停下来"，并节流。
                 # `login_notified_at == 0` 这一支是**第一次遇到**：
                 # 节流不能把第一次提醒也节掉（否则前面几步它还在盲目横跳）。
                 if login_notified_at == 0 or step - login_notified_at >= LOGIN_NOTIFY_EVERY:
                     login_notified_at = step
-                    history.append(login_blocked_warning(state.login_reason))
+                    # 两种拦截的措辞**不能混用**：登录墙要它"别横跳、先登录"，
+                    # 空白页要它"别拿空白当证据去下结论"。指错方向比不说更糟。
+                    history.append(
+                        login_blocked_warning(blocked_reason)
+                        if state.is_login_wall
+                        else page_blocked_warning(blocked_reason)
+                    )
 
             # ---------- 停滞检测：这一步到底有没有得到新信息？----------
             # 放在"想（Reason）"**之前**，是为了让下面的警告进到本轮 prompt 里 ——

@@ -61,7 +61,7 @@ def test_console_page_is_served(client):
     assert body.lstrip().lower().startswith("<!doctype html")
     assert "browser-agent" in body
     # 控制台靠这几个 id 挂逻辑，改名就得同步改这里
-    for anchor in ('id="task"', 'id="url"', 'id="go"', 'id="tb"'):
+    for anchor in ('id="task"', 'id="url"', 'id="go"', 'id="tb"', 'id="headful"'):
         assert anchor in body, f"控制台缺少锚点 {anchor}"
 
 
