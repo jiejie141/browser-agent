@@ -41,11 +41,12 @@ SCAN_CAP = 500
 # 又挡得住"几百个分类链接"。
 CHROME_QUOTA = 25
 
-# 一条扫描路径最多往下钻多少层 shadowRoot。
-#
-# 正常的 Web Components 嵌套不超过 2~3 层；设上限是为了防住"组件里套自己"
-# 那种写法 —— 每层都要把整棵子树 querySelectorAll 一遍，层数一多就是纯浪费。
-_SHADOW_DEPTH = 5
+# 一条扫描路径最多往下钻多少层 shadowRoot：JS 里内联为 5
+# （见 _COLLECT_JS 顶部注释）。正常的 Web Components 嵌套不超过 2~3 层；
+# 设上限是为了防住"组件里套自己"那种写法 —— 每层都要把整棵子树
+# querySelectorAll 一遍，层数一多就是纯浪费。
+# ⚠️ 这里曾有个 Python 侧常量 _SHADOW_DEPTH = 5，但 JS 读不到 Python 常量，
+#    它一直是没人引用的死代码（改它不会有任何效果），已删（2026-09-22）。
 
 # 一趟感知最多扫几个 frame。
 #
@@ -380,16 +381,25 @@ async def extract_elements(page: Page, max_frames: int = MAX_FRAMES) -> list[Ele
         fi, lidx = owner.get(int(gidx), (0, int(gidx)))
         by_frame.setdefault(fi, []).append([lidx, ref])
 
+    failed_frames: set[int] = set()
     for fi, apply_pairs in by_frame.items():
         frame = frame_of.get(fi)
         if frame is None:
+            failed_frames.add(fi)
             continue
         try:
             await frame.evaluate(_APPLY_JS, apply_pairs)
         except Exception as exc:
-            # 编号没写全就不要往外报：报出来的编号点不到，比"没元素"更误导。
-            log.warning("回写元素编号失败（frame %d）: %s", fi, exc)
-            return []
+            # 编号没写全的 frame 不要往外报：报出来的编号点不到，比"没元素"更误导。
+            # 但只丢**这一个** frame —— 早先直接 return [] 会把已成功编号的
+            # 主文档元素一起丢掉，整个页面瞬间"全盲"（2026-09-22 审查发现）。
+            log.warning("回写元素编号失败（frame %d），仅丢弃该 frame 的元素: %s", fi, exc)
+            failed_frames.add(fi)
+    if failed_frames:
+        pairs = [
+            (g, r) for g, r in pairs
+            if owner.get(int(g), (0, 0))[0] not in failed_frames
+        ]
 
     by_gidx = {int(c["gidx"]): c for c in all_cands}
     elements: list[Element] = []

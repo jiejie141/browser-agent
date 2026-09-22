@@ -864,7 +864,10 @@ class ReActAgent:
             # 引擎在这里的角色是"把模型看不到的事实告诉它"，不是替它做决定。
             # 登录墙上不再发振荡警告：上面已经给过**更具体**的解释了，
             # 同时喂两句会互相打架（一句说"换做法"，一句说"绕圈子"）。
-            if not closing and not state.is_login_wall and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
+            # 验证码同理：等待人工期间 DOM 必然不动，页面指纹必然重复，
+            # 这时候发"你在原地打转"纯属误导（2026-09-22 审查发现）。
+            if (not closing and not state.is_login_wall and not state.is_captcha
+                    and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY):
                 osc_pages = oscillation_pages(fp_history)
                 if osc_pages is not None:
                     osc_notified_at = step

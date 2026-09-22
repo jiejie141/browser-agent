@@ -513,3 +513,76 @@ class TestCaptchaHandoff:
 
 
 # ---------------------------------------------------------------------------
+# 2026-09-22 审查尾账的钉住测试（fake frame 即可，不需要真浏览器 ——
+# 这里测的是 Python 侧的降级策略，不是 JS 的扫描行为）：
+# ① 单个 frame 回写编号失败只丢该 frame，不再整页"全盲"。
+# ---------------------------------------------------------------------------
+
+
+class _FakeFrame:
+    """最小 fake：collect 返回造好的候选，apply 可配置为抛异常。"""
+
+    def __init__(self, cands, fail_apply=False):
+        self._cands = cands
+        self._fail_apply = fail_apply
+
+    async def evaluate(self, js, arg=None):
+        from bagent.perception import _APPLY_JS, _COLLECT_JS
+
+        if js == _COLLECT_JS:
+            return self._cands
+        if js == _APPLY_JS:
+            if self._fail_apply:
+                raise RuntimeError("frame detached during apply")
+            return None
+        raise AssertionError(f"unexpected evaluate: {js[:40]}")
+
+
+class _FakePage:
+    def __init__(self, frames):
+        self.main_frame = frames[0]
+        self.frames = frames
+
+
+def _cand(idx, text):
+    return {"idx": idx, "tag": "button", "text": text, "aria": "",
+            "placeholder": "", "region": "main"}
+
+
+def test_frame_apply_failure_drops_only_that_frame():
+    """钉住审查发现的问题：任何一个 iframe 回写失败，旧实现直接 return []，
+    主文档已成功编号的元素也被一起丢掉，页面瞬间"全盲"。
+    现在必须只丢失败的那个 frame。"""
+    main = _FakeFrame([_cand(0, "主文档按钮")])
+    broken = _FakeFrame([_cand(0, "iframe按钮")], fail_apply=True)
+    page = _FakePage([main, broken])
+
+    elements = asyncio.run(extract_elements(page))
+
+    texts = [e.text for e in elements]
+    assert "主文档按钮" in texts, f"主文档元素不该被 iframe 的失败连坐: {texts}"
+    assert "iframe按钮" not in texts, f"编号没写上的元素不能往外报: {texts}"
+
+
+def test_captcha_and_login_wall_render_mutually_exclusive():
+    """验证码与登录墙同时命中时，prompt 只能给**一条**指令（验证码优先，
+    与引擎的阻塞判定优先级一致）。两段一起渲染等于对模型说
+    "去登录"和"别动，交给人"两句互相矛盾的话。"""
+    from bagent.models import PageState
+
+    state = PageState(
+        url="https://example.com/login", title="安全验证",
+        elements=[], body_text="请完成滑块验证后登录",
+        is_captcha=True, captcha_reason="可见验证码组件",
+        is_login_wall=True, login_reason="URL+文案+密码框",
+    )
+    rendered = state.render_for_prompt()
+    assert "验证码" in rendered
+    assert "登录墙" not in rendered, "两段同时渲染会给模型互相矛盾的指令"
+
+    only_login = PageState(
+        url="https://example.com/login", title="登录",
+        elements=[], body_text="请登录",
+        is_login_wall=True, login_reason="URL 命中",
+    )
+    assert "登录墙" in only_login.render_for_prompt()

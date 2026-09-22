@@ -493,7 +493,10 @@ class LangGraphReActAgent:
         # 本步有没有因"振荡"提醒过（每步重置，写进 trace 供事后核对）
         osc_warned = 0
         # 登录墙上不发振荡警告：上面已经给过更具体的解释，同时喂两句会互相打架。
-        if not closing and not st.is_login_wall and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
+        # 验证码同理：等待人工期间页面指纹必然重复，发"原地打转"纯属误导
+        # （2026-09-22 审查发现，与 agent.py 同步修）。
+        if (not closing and not st.is_login_wall and not st.is_captcha
+                and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY):
             osc_pages = oscillation_pages(fp_history)
             if osc_pages is not None:
                 osc_notified_at = step

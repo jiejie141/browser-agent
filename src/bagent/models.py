@@ -224,6 +224,10 @@ class PageState(BaseModel):
             lines.append("  (这一帧没有解析到可交互元素——可能是页面还在加载，")
             lines.append("   或者内容在 Canvas / iframe 里，可以试试 scroll 或 screenshot)")
 
+        # 验证码与登录墙**互斥渲染**：一个要求登录的页面同时挂着滑块时，
+        # 两段一起出现会给模型两条矛盾的指令（"去登录" vs "别动，交给人"），
+        # 而引擎侧的阻塞判定也是验证码优先（agent.py / graph_agent.py），
+        # prompt 必须和引擎保持同一个优先级（2026-09-22 审查发现）。
         if self.is_captcha:
             # 这一段的关键不是"描述页面"，而是**禁止一类动作**。
             # 实测形态：模型看见"向右滑动填充拼图"就去点/拖那个滑块，
@@ -240,8 +244,7 @@ class PageState(BaseModel):
                 "如果一直没有人来完成验证，就 finish 说明"
                 "「遇到验证码，需要人工处理」。",
             ]
-
-        if self.is_login_wall:
+        elif self.is_login_wall:
             # 把"你被挡住了"这件模型自己看不出来的事说清楚。
             # 只说"这是登录页"不够 —— 还必须告诉它**来回切换没有用**，
             # 否则它下一秒就又去点内容页了（这就是用户看到的横跳）。
