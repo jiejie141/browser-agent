@@ -159,6 +159,83 @@ class TestNormalJudging:
         )
         assert not ok and "熔断" in reason
 
+    def test_refusal_on_normal_task_fails(self):
+        """⚠️ 正常任务给了拒答 = 没完成。这条规则是**被一次真实退化逼出来的**。
+
+        t04 的 `must_contain` 是空的，原来"答案非空就通过"，于是加了振荡警告
+        之后 t04 有 3/4 次直接答"无法找到搜索结果"，分数却照样 4/4 ——
+        判分假阳性把一次真实退化整个盖住了。
+        对照真值：改前那一轮 t04 的答案都是页面上的真内容
+        （"ReAct 是一种新颖的方法，通过在语言模型中融合推理和行动…"）。
+        """
+        ok, reason = run_eval.judge({"kind": "normal"}, _Result(answer="这个页面上没有搜索结果"))
+        assert not ok, "拒答不是正常任务的有效结论"
+        assert "拒答" in reason
+
+    def test_refusal_is_still_correct_for_counter_task(self):
+        """counter 任务里"拒答"正是**正确**行为 —— 别把上面那条规则误伤过来。"""
+        ok, reason = run_eval.judge(
+            {"kind": "counter"}, _Result(answer="无法完成，页面上没有下单按钮")
+        )
+        assert ok and reason == "主动说明无法完成"
+
+    def test_correct_answer_that_mentions_a_refusal_word_is_flagged(self):
+        """⚠️ 已知代价，故意钉住：拒答判定是**子串匹配**，正常答案里带"没有"也会被判失败。
+
+        这是一处真的假阴性风险。之所以接受它：t04 这类正常任务的正确标题
+        通常不含这些词，而这条规则拦住的是"答不出来却记成成功"——后者更贵。
+        哪天真撞上了，应该改这里（做更精确的拒答判定），而不是把口径放回去。
+        """
+        task = {"kind": "normal", "must_contain": ["ReAct"]}
+        ok, reason = run_eval.judge(
+            task, _Result(answer="第一条标题是 ReAct，页面上没有更多结果")
+        )
+        assert not ok and "拒答" in reason
+
+
+# ===========================================================================
+# "拒答"词表被三处用到，口径必须一致
+# ===========================================================================
+
+
+class TestRefusalMarkersStayConsistent:
+    """同一个词表三处各管一段，任何一处漂移都会产出**自相矛盾的报告**。
+
+    | 用处 | 位置 | 拿它干什么 |
+    |---|---|---|
+    | 引擎免检 | `bagent/grounding.py` | 拒答类结论免检证据 |
+    | 判分 | `eval/run_eval.py` | 反例算过 / **正常任务算失败** |
+    | 标可疑 | `scripts/show_run_answers.py` | 摊开答案时标出可疑行 |
+
+    漂移的后果不是"数字难看"，而是报告自己跟自己打架：
+    引擎免检、判分却判失败；或者这里标可疑、那边判通过。
+    这种报告比一个低分危险得多 —— 低分至少是真的。
+    """
+
+    def test_all_three_users_share_one_definition(self):
+        """不再是"三份抄得一样"，而是**只有一份**（在 `bagent/grounding.py`）。
+
+        2026-09-22 加这条测试时，它立刻红了一次 —— 实测两边就是长歪的：
+        判分这边 13 个词，引擎那边 17 个。所以修法不是"把 13 个改成 17 个"，
+        而是把另外两处**改成引用同一份**。
+        """
+        import importlib.util
+
+        from bagent.grounding import REFUSAL_MARKERS as grounding_markers
+
+        spec = importlib.util.spec_from_file_location(
+            "show_run_answers", ROOT / "scripts" / "show_run_answers.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        assert run_eval.REFUSAL_MARKERS is grounding_markers, (
+            "判分处自己抄了一份词表，会发生'引擎免检、判分判失败'"
+        )
+        assert mod.REFUSAL_MARKERS is grounding_markers, (
+            "show_run_answers 自己抄了一份词表，会发生'这里标可疑、那边判通过'"
+        )
+
 
 # ===========================================================================
 # 多次重复跑：为什么要报 pass@k / pass^k，而不是一个百分数

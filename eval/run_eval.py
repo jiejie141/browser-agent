@@ -49,6 +49,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from bagent.agent import ReActAgent, new_run_dir  # noqa: E402
 from bagent.browser import open_browser, proxy_launch_kwargs  # noqa: E402
 from bagent.config import MAX_STEPS_DEFAULT, get_settings, resolve_int  # noqa: E402
+# "拒答"词表只有这一份来源（引擎免检与判分必须同口径，见 judge() 里的说明）
+from bagent.grounding import REFUSAL_MARKERS  # noqa: E402
 from bagent.llm import build_client  # noqa: E402
 from bagent.siteprobe import looks_like_throttle  # noqa: E402
 
@@ -136,11 +138,15 @@ async def preflight(urls: list[str], *, min_interval: float = 1.0) -> dict[str, 
             await browser.close()
     return out
 
-# 反例任务里，出现这些词就认为 Agent 正确表达了"做不到"
-REFUSAL_MARKERS = (
-    "无法", "不能", "没有", "不存在", "做不到", "不具备", "不支持",
-    "找不到", "不可用", "没有找到", "无法完成", "需要登录", "无登录",
-)
+# 反例任务里，出现这些词就认为 Agent 正确表达了"做不到"；
+# 正常任务里出现这些词，则按第八节 8.15 那条判为"没完成"。
+#
+# ⚠️ 词表**只有一份**，在 `bagent/grounding.py`（本文件上面的 import 里）。
+# 以前这里自己抄了一份，两边悄悄长歪了：这边 13 个、那边 17 个
+# （这边多"无登录"，那边多"请先登录/未提供/未找到/不含/未显示"）。
+# 后果正是 grounding.py 文档里警告过的那种自相矛盾 ——
+# 引擎按"拒答"免检，判分却因为词表里没有它而判失败。
+# 2026-09-22 加 `TestRefusalMarkersStayConsistent` 时就是被这个差异挡下来的。
 
 
 def _probe_urllib(url: str, timeout: float) -> tuple[bool, str]:
@@ -322,6 +328,17 @@ def judge(task: dict, result) -> tuple[bool, str]:
     # normal 任务
     if not result.finished:
         return False, result.error or "未完成"
+    # ⚠️ 正常任务给了"拒答"不算完成 —— 这一条是**被一次真实退化逼出来的**。
+    #
+    # t04 的 `must_contain` 是空的（见 tasks/examples.json），而下面那条
+    # "没写锚点就只看 answer 非空"的规则意味着：**t04 的分数其实只测了"有没有输出"**。
+    # 加上振荡警告之后，t04 有 3/4 次直接答"无法找到搜索结果"，分数却照样 4/4 ——
+    # 判分假阳性把一次真实退化整个盖住了。
+    #
+    # normal 任务是有确定答案的（t01~t04 都是可答的），"我做不到"就是没完成。
+    # 注意别和 counter 任务搞混：那边的"拒答"正是**正确**行为，走上面的分支。
+    if any(m in answer for m in REFUSAL_MARKERS):
+        return False, f"正常任务却给了拒答（不是有效结论）: {answer[:40]}"
     needed = task.get("must_contain") or []
     patterns = task.get("must_regex") or []
     if isinstance(patterns, str):

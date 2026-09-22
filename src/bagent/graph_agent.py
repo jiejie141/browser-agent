@@ -51,6 +51,8 @@ from .agent import (
     LOOP_STOP_AT,
     LOOP_WARN_AT,
     MAX_CONSECUTIVE_FAILURES,
+    OSCILLATION_NOTIFY_EVERY,
+    OSCILLATION_WINDOW,
     STALL_STOP_AT,
     STALL_WARN_AT,
     SYSTEM_PROMPT,
@@ -58,6 +60,8 @@ from .agent import (
     StepCallback,
     _action_signature,
     loop_counts,
+    oscillation_pages,
+    oscillation_warning,
     page_fingerprint,
     update_stall,
 )
@@ -144,6 +148,14 @@ class AgentState(TypedDict, total=False):
     last_action: object
     stall_count: int
     closing: bool
+    # 振荡检测：需要**一整个窗口**的指纹历史（停滞检测只要上一帧），
+    # 所以这里单独存序列。`osc_notified_at` 是上一次注入振荡警告的步号，
+    # 用来节流 —— 模型不听时不能每步都重发，否则 prompt 会越长越长。
+    fp_history: list[str]
+    osc_notified_at: int
+    # 本步有没有因"振荡"提醒过 / 当时窗口里几个页面（0 = 没提醒）。
+    # 记账用，不参与判定。手写引擎里是循环局部变量 `osc_warned`。
+    osc_pages: int
     closing_steps: int
     # 节点内部流转
     page_state: object
@@ -293,6 +305,26 @@ class LangGraphReActAgent:
                 f"请换一个明显不同的做法，或者直接调用 finish 给出你目前的结论。"
             )
 
+        # ---------- 振荡检测：在已经去过的几个页面之间来回走 ----------
+        # 与手写引擎共用**同一个判据函数**（oscillation_pages）和**同一段提示文本**
+        # （oscillation_warning）—— 原来两边各抄一份、靠注释声明"逐字一致"，
+        # 结果真的漂移过；改成共用函数后，漂移在结构上就不可能了。
+        #
+        # 只发警告、不进收束、不拦动作 —— 理由见 agent.py 常量区的实测说明
+        # （该信号在已收敛运行上也会触发，约一半、含 11 条 normal，
+        # 拿去熔断会连 t04 的正常往返一起打掉）。
+        fp_history = list(state.get("fp_history") or [])
+        fp_history.append(cur_fp)
+        osc_notified_at = state.get("osc_notified_at", 0)
+        # 本步有没有因"振荡"提醒过（每步重置，写进 trace 供事后核对）
+        osc_warned = 0
+        if not closing and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
+            osc_pages = oscillation_pages(fp_history)
+            if osc_pages is not None:
+                osc_notified_at = step
+                osc_warned = osc_pages
+                history.append(oscillation_warning(osc_pages))
+
         out: dict = {
             "step": step,
             "page_state": st,
@@ -302,6 +334,9 @@ class LangGraphReActAgent:
             "stall_count": stall_count,
             "closing": closing,
             "closing_steps": closing_steps,
+            "fp_history": fp_history[-24:],
+            "osc_notified_at": osc_notified_at,
+            "osc_pages": osc_warned,
         }
         if len(history) != len(state.get("history") or []):
             out["history"] = history[-12:]
@@ -450,6 +485,7 @@ class LangGraphReActAgent:
                 StepRecord(
                     step=step, action=action, ok=False, message=message,
                     url_after=st.url, page_fp=state.get("prev_fp", ""), stall_count=stall,
+                    osc_pages=state.get("osc_pages", 0),
                 ).model_dump()
             )
             if self.on_step:
@@ -488,6 +524,7 @@ class LangGraphReActAgent:
                 url_after=session.page.url if session.page else "",
                 screenshot_path=st.screenshot_path,
                 page_fp=state.get("prev_fp", ""), stall_count=state.get("stall_count", 0),
+                osc_pages=state.get("osc_pages", 0),
             ).model_dump()
         )
         if self.on_step:
@@ -581,6 +618,11 @@ class LangGraphReActAgent:
                 "stall_count": 0,
                 "closing": False,
                 "closing_steps": 0,
+                # 振荡检测初值：历史为空 → 窗口还没凑够，判不出振荡（见 osc_notified_at 的说明）。
+                "fp_history": [],
+                "osc_notified_at": 0,
+                # 本步振荡提醒的记账值（0 = 没提醒），每步由 perceive 覆盖
+                "osc_pages": 0,
                 "finished": False,
                 "answer": "",
                 "error": "",

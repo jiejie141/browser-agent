@@ -567,3 +567,237 @@ def test_handwritten_engine_also_enforces_closing():
     src = inspect.getsource(hand.ReActAgent.run)
     assert "收束阶段不接受" in src, "手写引擎也要拦收束期的非 finish 动作"
     assert "if closing and action.action != \"finish\"" in src
+
+
+class TestOscillationDetection:
+    """振荡检测：抓"动作各异、页面也确实在变，但在同一小片区域里来回走"。
+
+    ## 为什么还要第三套判据
+
+    前两套各有一个明确的盲区，而 t06 的失败形态**同时落在两个盲区里**：
+
+      · 动作指纹看"行为有没有重复" —— 振荡时动作是**交替**的
+        （点站点名 / 点加入购物车 / 点站点名 / …），任何单个动作的连续次数都停在 1；
+      · 停滞检测看"页面有没有变" —— 振荡时页面每步都在变（A→B→A→B），
+        实测（`runs/eval_20260922-085119.json`）停滞计数全程只有 0~2，
+        **一次警告都没注入过**。模型在书籍站的详情页与目录页之间走了 30 步，
+        反复点「Add to basket」，全程没收到任何提示。
+
+    ## ⚠️ 这套判据**只发警告，不熔断** —— 这是被数据定下来的
+
+    `scripts/choose_oscillation_rule.py` 在已落盘轨迹上比过七组候选（各扫 n/w）。
+    最好的一组 `D(n=3, w=4)`（重走同一条边 >=3 次）：
+    **受害运行 19/19 全抓到，但已收敛的运行里也有 29/62 触发，其中 11 条是 normal**
+    （主要是 t04 必应"首页 ↔ 结果页"的正常往返）。数字是 2026-09-22 快照。
+
+    分不开的根本原因是：t06 失败与通过的那些运行**行为本身一样**（都在来回走），
+    差别只在"最后有没有收尾"。所以这个信号里没有足够信息去替模型判断"该不该死"。
+    → 不替它判断。引擎只把"你绕了几步"这个模型自己看不到的事实讲清楚。
+    """
+
+    def test_returns_none_when_history_too_short(self):
+        """历史还没凑够一个窗口时判不出来 —— 不能凭前几步就喊"你在打转"。"""
+        from bagent.agent import oscillation_pages
+
+        assert oscillation_pages([]) is None
+        assert oscillation_pages(["a"]) is None
+        assert oscillation_pages(["a", "b", "a", "b"]) is None  # len == window，没有"更早"
+
+    def test_fires_on_two_page_oscillation(self):
+        """A→B→A→B 且都在已去过的页面里 → 报出窗口内的页面数。"""
+        from bagent.agent import oscillation_pages
+
+        # 先正常探索出两个页面，然后开始来回走
+        fps = ["x", "a", "b", "a", "b", "a", "b"]
+        assert oscillation_pages(fps, window=4, max_pages=2) == 2
+
+    def test_new_page_in_window_means_progress(self):
+        """窗口里只要有**从没见过**的页面，就是有进展，不算振荡。
+
+        这条是拿来挡 t04 的：必应"首页 ↔ 结果页"也在重走同一条边，
+        但它每轮都在拿到新的结果页 —— 那是干活，不是打转。
+        """
+        from bagent.agent import oscillation_pages
+
+        fps = ["x", "a", "b", "a", "c"]  # 最后一步走到了新的 c
+        assert oscillation_pages(fps, window=4, max_pages=2) is None
+
+    def test_three_pages_in_window_is_not_oscillation(self):
+        """窗口里同时出现 3 个不同页面 → 不算"来回走"，宁可漏也不能乱喊。"""
+        from bagent.agent import oscillation_pages
+
+        fps = ["a", "b", "c", "a", "b", "c"]
+        assert oscillation_pages(fps, window=4, max_pages=2) is None
+
+    def test_single_page_repeat_is_left_to_stall_detector(self):
+        """窗口里只有**同一个**页面时返回 None —— 那是停滞检测的活，不是这里的。
+
+        两套机制各管一半、刻意不重叠（和 PROGRESS_ACTIONS 排除 type 是同一个处理方式）。
+        如果这里也报，同一个现象会同时收到两条警告，prompt 白涨。
+        """
+        from bagent.agent import oscillation_pages
+
+        fps = ["a", "a", "a", "a", "a", "a"]
+        assert oscillation_pages(fps, window=4, max_pages=2) is None
+
+    def test_would_have_fired_on_the_real_t06_failure(self):
+        """拿真实失败轨迹的 `page_fp` 序列回放，确认这条判据**原本就能触发**。
+
+        用真正落盘的指纹（`runs/20260922-084259-t06/trace.json`）而不是编的序列 ——
+        编的序列只能证明"函数按我设想的方式工作"，证明不了"它在真实数据上会触发"。
+
+        只断言"会触发"，**不断言"触发后任务就通过了"**：
+        后者只有真跑能回答（本轮就是这么被教育过的）。
+        """
+        import json
+        from pathlib import Path
+
+        from bagent.agent import OSCILLATION_WINDOW, oscillation_pages
+
+        trace = Path(__file__).resolve().parents[1] / "runs" / "20260922-084259-t06" / "trace.json"
+        if not trace.exists():
+            import pytest
+
+            pytest.skip("轨迹文件不在（runs/ 未随仓库分发）")
+
+        fps = [r.get("page_fp") or "" for r in json.loads(trace.read_text(encoding="utf-8"))["records"]]
+        hit_at = next(
+            (i for i in range(1, len(fps) + 1) if oscillation_pages(fps[:i]) is not None),
+            None,
+        )
+        assert hit_at is not None, "这条真实失败轨迹必须在振荡判据下触发"
+        assert hit_at <= 15, f"触发得太晚（第 {hit_at} 步）就来不及救这次运行了"
+        assert OSCILLATION_WINDOW >= 1
+
+
+def test_langgraph_perceive_node_wires_the_oscillation_detector(monkeypatch):
+    """图引擎的 perceive 节点必须真的接上振荡检测，并把 `fp_history` 传下去。
+
+    图引擎最容易坏的地方不是判据本身，而是**状态字段没声明** ——
+    LangGraph 只传声明过的键，漏一个就会静默丢掉（`grounding_retries`
+    和上一批停滞字段都踩过同一个坑）。所以这里断言：
+      · 警告进了 history；
+      · `fp_history` 确实被累积；
+      · `osc_notified_at` 被记下（节流靠它，不记就等于每步都重发）。
+    """
+    import asyncio
+
+    from bagent import graph_agent as g
+    from bagent.agent import OSCILLATION_NOTIFY_EVERY
+    from bagent.config import Settings
+    from bagent.models import PageState
+
+    pages = {
+        "https://x/a": PageState(url="https://x/a", title="A", body_text="A 的正文"),
+        "https://x/b": PageState(url="https://x/b", title="B", body_text="B 的正文"),
+    }
+    # 判据要求"两个页面都先在更早的部分出现过，再纯振荡满一个窗口"，
+    # 所以最少要 window+2 步才可能触发 —— 这里给 8 步，留足余量。
+    # （真实 t06 的触发点是第 10 / 13 步，见上一个用例。）
+    seq = ["https://x/a", "https://x/b"] * 4
+    box = {"n": 0}
+
+    async def fake_perceive(page, settings, *, step, run_dir, prefer_vision=False):
+        url = seq[min(box["n"], len(seq) - 1)]
+        box["n"] += 1
+        return pages[url]
+
+    monkeypatch.setattr(g, "perceive", fake_perceive)
+
+    class _FakeSession:
+        page = object()
+
+    agent = g.LangGraphReActAgent(Settings(), llm=object())
+    agent._session = _FakeSession()
+    agent._run_dir = None
+
+    hist: list[str] = []
+    fps: list[str] = []
+    notified = 0
+    for _ in seq:
+        out = asyncio.run(
+            agent._node_perceive(
+                _st(
+                    step=len(fps),
+                    history=hist,
+                    fp_history=fps,
+                    osc_notified_at=notified,
+                    prev_fp=fps[-1] if fps else "",
+                )
+            )
+        )
+        hist = out.get("history", hist)
+        fps = out["fp_history"]
+        notified = out["osc_notified_at"]
+
+    assert len(fps) == len(seq), "指纹历史必须逐步累积"
+    assert notified > 0, "检测到振荡时必须记录注入步号（节流要用）"
+    assert any("来回走" in h for h in hist), "振荡警告必须进 history，否则模型看不到"
+    assert OSCILLATION_NOTIFY_EVERY >= 1
+
+
+def test_handwritten_engine_also_wires_the_oscillation_detector():
+    """手写引擎要有同一套振荡检测 —— 两个引擎的口径必须一致。
+
+    同 `test_handwritten_engine_also_enforces_closing`：手写版的这段逻辑埋在
+    run() 的循环里，没有图版那样可以直接喂状态的口子，所以只能查源码。
+    这不是理想的测法，但比不测强 —— 两个引擎一旦漂移，A/B 对比就失去意义，
+    而漂移恰恰是本项目最想避免的事（阈值、指纹、计数都为此提成模块级共享）。
+    """
+    import inspect
+
+    from bagent import agent as hand
+
+    src = inspect.getsource(hand.ReActAgent.run)
+    assert "oscillation_pages(fp_history)" in src, "手写引擎也要调振荡判据"
+    assert "fp_history.append(cur_fp)" in src, "指纹历史必须逐步累积"
+    assert "osc_notified_at" in src, "必须节流，否则模型不听时每步都重发警告"
+
+
+class TestOscillationWarningText:
+    """注入的提示文本本身也要测 —— 提示词是行为的一部分，措辞改错就是行为改错。
+
+    这里钉的是一次**真实事故**：第一版文本结尾写了
+    "如果已经确认这件事做不到，就直接 finish…（这类结论免检 evidence）"，
+    等于在循环里发了一张"答不出来就交差"的通行证。结果**正常任务** t04
+    （必应搜 ReAct 论文读第一条标题）4 次里有 3 次直接答
+    "无法找到搜索结果"，而改前 4 次答的都是页面上的真内容。
+    """
+
+    def test_does_not_dangle_an_evidence_exemption(self):
+        """别在循环里把"免检 evidence"当奖励发出去 —— 这条就是那次退化的开关。"""
+        from bagent.agent import oscillation_warning
+
+        text = oscillation_warning(2)
+        assert "免检" not in text
+        assert "evidence" not in text
+
+    def test_separates_circling_from_impossible(self):
+        """必须显式区分"还没找到"与"页面上没有"：绕圈子≠任务做不到。"""
+        from bagent.agent import oscillation_warning
+
+        text = oscillation_warning(2)
+        assert "还没找到" in text and "页面上没有" in text
+
+    def test_reports_the_page_count(self):
+        """说清"你只在 N 个页面之间来回"——这是模型自己看不到的事实。"""
+        from bagent.agent import oscillation_warning
+
+        assert "3 个" in oscillation_warning(3)
+
+    def test_both_engines_inject_the_same_text(self):
+        """两个引擎必须注入**同一份**文本。
+
+        以前两边各抄一份、靠注释声明"逐字一致"，实测真的漂移过：改了 agent.py
+        忘了 graph_agent.py，而没有任何测试会红。改成共享函数之后，这里再加一道
+        源码级断言，防止以后有人又把文本内联回去。
+        """
+        import inspect
+
+        from bagent import agent as hand
+        from bagent import graph_agent as g
+
+        assert "oscillation_warning(" in inspect.getsource(hand.ReActAgent.run)
+        assert "oscillation_warning(" in inspect.getsource(
+            g.LangGraphReActAgent._node_perceive
+        )

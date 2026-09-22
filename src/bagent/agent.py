@@ -71,6 +71,10 @@ SYSTEM_PROMPT = """你是一个浏览器自动化 Agent。你的目标是通过�
 - 不要点「← Previous」「Next →」这类翻页链接，除非任务明确要求翻页。
 - 如果某个动作已经连续做过两次却没有带来任何新信息，立刻停止它，
   改用 finish 给出你目前能给出的结论。
+- ⚠️「没有新信息」**不等于**"同一个动作连续重复"。**在已经去过的几个页面之间来回走、
+  一直没走到新页面，同样是没有新信息** —— 哪怕你每一步点的都是不同的东西。
+  这是最常见的死循环形态，一旦出现就不要再试第二次，直接 finish。
+  如果连"做不到"都还没确认清楚，就在 answer 里写清你已经试到哪一步。
 
 关于 evidence（**引擎会核对，对不上会被退回重做**）：
 - finish 必须带 evidence：从**当前页面正文摘要**里**原样复制**一段能支撑结论的原文
@@ -134,6 +138,37 @@ CLOSING_MAX_STEPS = 3
 # 它在输入框上的原地打转由**动作指纹**那一套负责（t04 的 type#20 连打就是它抓的）——
 # 两套机制各管一半，故意留的互补，不是漏掉了。
 PROGRESS_ACTIONS = ("click", "goto", "press", "scroll")
+
+
+# ---- 振荡检测（抓"动作各不相同、页面也确实在变，但在同一小片区域里来回走"）----
+#
+# 前两套判据都抓不到它，原因是它们看的东西不对：
+#   · 动作指纹看"行为有没有重复" —— 振荡时动作是**交替**的（点站点名 / 点加入购物车 /
+#     点站点名 / …），任何单个动作的"连续次数"都停在 1；
+#   · 停滞检测看"页面有没有变" —— 振荡时页面每一步都在变（A→B→A→B），
+#     停滞计数全程只有 0~2，**一次警告都不会注入**。
+#
+# 实测（`runs/eval_20260922-085119.json`，t06 两条失败轨迹）：模型在书籍站的
+# 详情页与目录页之间来回走了 30 步、反复点「Add to basket」，全程没收到任何提示。
+#
+# ## 为什么只用它发警告，不用它熔断
+#
+# 离线在已落盘轨迹上比过七组候选判据（`scripts/choose_oscillation_rule.py`：
+# "同页连续"、"未见新页"、"重走同一条边"、"窗口内无新页 + 重走同一条边"…，
+# 每组再扫 n/w 参数）。最好的一组是 `D(n=3, w=4)`（重走同一条边 ≥3 次）：
+# **受害运行 19/19 全抓到，但已收敛的运行里也有 29/62 会触发，其中 11 条是 normal**
+# （主要是 t04 必应"首页 ↔ 结果页"的正常往返）。**分不开。**
+# （数字是 2026-09-22 的快照，轨迹会随跑测增长；复算用上面那个脚本。）
+#
+# 分不开的根本原因是：t06 失败与通过的那些运行，**行为本身是一样的**（都在来回走），
+# 差别只在"最后有没有收尾"。所以这个信号里没有足够的信息去替模型做"该不该死"的判断。
+# → 那就不替它做。引擎只把"你绕了几步"这个**它自己看不到的事实**说清楚，
+#   收不收尾仍然由模型决定（收尾判据见提示词里那条"什么时候该收手"）。
+OSCILLATION_WINDOW = 4      # 只看最近 4 步
+OSCILLATION_MAX_PAGES = 2   # 窗口里的不同页面数 ≤ 2 才算"打转"
+# 同一条警告至少隔几步才重复注入一次。不节流的坏处很实在：
+# 模型一旦不听，后面每一步都背一段越来越长的警告，prompt 迅速膨胀。
+OSCILLATION_NOTIFY_EVERY = 3
 
 
 def _action_signature(action: Action) -> str:
@@ -302,6 +337,74 @@ def update_stall(prev_fp: str, cur_fp: str, action_name: str | None, count: int)
     return 0 if cur_fp != prev_fp else count + 1
 
 
+def oscillation_pages(
+    fp_history: list[str],
+    window: int = OSCILLATION_WINDOW,
+    max_pages: int = OSCILLATION_MAX_PAGES,
+) -> int | None:
+    """最近 `window` 步是否"只在已去过的 ≤`max_pages` 个页面之间来回走"。
+
+    是则返回窗口里实际涉及的不同页面数（供警告文案用），否则返回 None。
+
+    两个条件缺一不可（这是**实测调出来的**，不是设计直觉）：
+
+    - **窗口内没有新指纹**：光"重走同一条边"不够 —— 必应"首页 ↔ 结果页"的正常往返
+      也满足它，而那种往返每轮都在拿到新结果页。加这一条把 t04 那类误触挡掉一部分。
+    - **窗口内不同页面数落在 [2, max_pages]**：下界 2 是**刻意**的 ——
+      窗口里只有同一个页面时，那是"页面一字未变"，归 `update_stall` 管；
+      这里只管"在**多个**页面之间来回"。两套机制各管一半，是互补不是重叠
+      （和 `PROGRESS_ACTIONS` 排除 `type` 是同一个处理方式）。
+      上界则由"没有新页面"这条兜着：没有新页面 + 不同页面数很少 = 在小片区域里绕。
+
+    ⚠️ 它**不是**熔断判据，只是"值得告诉模型的一件事"。理由见常量区的说明：
+    这个信号在已收敛的运行上误触率太高（23/51），拿它熔断会把 t04 一起打掉。
+    """
+    if window < 1 or len(fp_history) <= window:
+        # 历史还不够长 —— 没有"更早"的部分可比，"新不新"无从判断。
+        return None
+    recent = fp_history[-window:]
+    earlier = set(fp_history[:-window])
+    if any(fp not in earlier for fp in recent):
+        return None  # 窗口里出现了以前没见过的页面 → 有进展
+    distinct = len(set(recent))
+    if not 2 <= distinct <= max_pages:
+        return None
+    return distinct
+
+
+def oscillation_warning(pages: int) -> str:
+    """振荡提醒的注入文本。**两个引擎共用这一份**。
+
+    以前这段文本在 agent.py 和 graph_agent.py 里各写了一遍，靠一句注释声明
+    "逐字一致"。实测中它就真的漂移了：改了一处忘另一处，两个引擎的提示词
+    从此不同，而没有任何测试会红。改成函数是**唯一能真正防漂移**的做法。
+
+    ## 措辞上踩过的坑（第一版就是这么写的，代价是一次真实退化）
+
+    第一版结尾是："如果已经确认这件事做不到，就**直接 finish**，在 answer 里
+    写清为什么做不到（这类结论免检 evidence，不需要引用不存在的东西）。"
+
+    它把"免检 evidence"当成了奖励发出去。结果模型在**正常任务**（t04，必应搜
+    ReAct 论文读第一条标题）上一收到提醒就去交差：4 次里 3 次答
+    "无法找到搜索结果"/"这个页面上没有搜索结果" —— 而改前 4 次答的都是页面上的
+    真内容。绕圈子只说明没走对路，不等于任务做不到；这两件事必须分开说。
+
+    所以现在这段文本：只给"换一个明显不同的做法"这条路，并且**显式拦住**
+    "把绕圈子当做不到"。免检规则仍然在 SYSTEM_PROMPT 的 evidence 一节里，
+    但不再在循环里当胡萝卜。
+    """
+    return (
+        f"⚠ 提醒：最近 {OSCILLATION_WINDOW} 步里，你只在"
+        f"**{pages} 个已经去过的页面之间来回走**，一步都没有走到新页面 —— "
+        f"这说明当前做法不会再带来新信息。"
+        f"请立刻换一个**明显不同**的做法（例如直接用 goto 打开一个明确的 URL，"
+        f"或从另一个入口重新开始），而不是再点一次同类的东西。\n"
+        f"⚠ 但别把「绕圈子」当成「做不到」：**「我还没找到」不等于「页面上没有」**。"
+        f"来回走只说明你没走对路。只有当你已经站在正确的页面上、"
+        f"确实确认过这件事无法完成，才把结论写成「做不到」；否则先换做法。"
+    )
+
+
 @dataclass
 class RunResult:
     """一次完整运行的产物。评测脚本读的就是这个。"""
@@ -385,8 +488,16 @@ class ReActAgent:
         stall_count = 0
         closing = False        # 是否已进入"收束"（逼结论）阶段
         closing_steps = 0
+        # 页面指纹历史。停滞检测只需要"上一帧"，振荡检测需要**一整个窗口**，
+        # 所以这里留下完整序列 —— 存的是 16 位哈希，不是正文，代价可以忽略。
+        fp_history: list[str] = []
+        osc_notified_at = 0    # 上一次振荡警告是在第几步注入的（用于节流）
 
         for step in range(1, max_steps + 1):
+            # 本步有没有因为"振荡"给过提醒（写进轨迹，供事后核对）。
+            # 每步重置：它是"这一步提醒了没有"，不是累计值。
+            osc_warned = 0
+
             # ---------- 看（Observe）----------
             state = await perceive(
                 session.page,
@@ -408,6 +519,7 @@ class ReActAgent:
                 stall_count,
             )
             prev_fp = cur_fp
+            fp_history.append(cur_fp)
 
             if stall_count >= STALL_STOP_AT:
                 if not closing:
@@ -431,6 +543,23 @@ class ReActAgent:
                     f"说明当前这个方向得不到新信息。"
                     f"请换一个明显不同的做法，或者直接调用 finish 给出你目前的结论。"
                 )
+
+            # ---------- 振荡检测：在已经去过的几个页面之间来回走 ----------
+            # 与上面两支**并列**，不是它的 else 分支：两支要抓的是不同的形态
+            # （一支页面完全不变，一支页面一直在变）。同时命中虽然少见，
+            # 但真发生时以更严重的停滞警告为准，所以放在 elif 链之外单独判。
+            #
+            # ⚠️ 这里**只发警告，不进收束、不拦动作**。理由写在常量区：
+            # 这个信号在已收敛的运行上也会触发（约一半，含 11 条 normal——
+            # 口径与出处见上方 OSCILLATION_* 常量区），拿它拦动作会连
+            # t04 的正常往返一起打掉。
+            # 引擎在这里的角色是"把模型看不到的事实告诉它"，不是替它做决定。
+            if not closing and step - osc_notified_at >= OSCILLATION_NOTIFY_EVERY:
+                osc_pages = oscillation_pages(fp_history)
+                if osc_pages is not None:
+                    osc_notified_at = step
+                    osc_warned = osc_pages   # 落进 trace，供事后核对
+                    history.append(oscillation_warning(osc_pages))
 
             # ---------- 想（Reason）----------
             user_prompt = self._build_prompt(task, state, history)
@@ -471,6 +600,7 @@ class ReActAgent:
                         screenshot_path=state.screenshot_path,
                         page_fp=cur_fp,
                         stall_count=stall_count,
+                        osc_pages=osc_warned,
                     )
                 )
                 if self.on_step:
@@ -496,7 +626,7 @@ class ReActAgent:
                         StepRecord(
                             step=step, action=action, ok=False, message=message,
                             url_after=state.url, screenshot_path=state.screenshot_path,
-                            page_fp=cur_fp, stall_count=stall_count,
+                            page_fp=cur_fp, stall_count=stall_count, osc_pages=osc_warned,
                         )
                     )
                     if self.on_step:
@@ -526,7 +656,7 @@ class ReActAgent:
                         step=step, action=action, ok=True,
                         message="任务结束" + ("（证据已核对）" if grounded else f"（{note}）"),
                         url_after=state.url,
-                        page_fp=cur_fp, stall_count=stall_count,
+                        page_fp=cur_fp, stall_count=stall_count, osc_pages=osc_warned,
                     )
                 )
                 if self.on_step:
@@ -556,7 +686,7 @@ class ReActAgent:
                     StepRecord(
                         step=step, action=action, ok=False, message=message,
                         url_after=state.url, screenshot_path=state.screenshot_path,
-                        page_fp=cur_fp, stall_count=stall_count,
+                        page_fp=cur_fp, stall_count=stall_count, osc_pages=osc_warned,
                     )
                 )
                 if self.on_step:
@@ -589,7 +719,7 @@ class ReActAgent:
                     step=step, action=action, ok=outcome_ok, message=message,
                     url_after=session.page.url if session.page else "",
                     screenshot_path=state.screenshot_path,
-                    page_fp=cur_fp, stall_count=stall_count,
+                    page_fp=cur_fp, stall_count=stall_count, osc_pages=osc_warned,
                 )
             )
             if self.on_step:
