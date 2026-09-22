@@ -353,6 +353,11 @@ async def run_task(task: dict, settings, max_steps: int | None) -> dict:
         "reason": reason,
         "answer": result.answer,
         "steps": result.steps,
+        # **这一步跑在多大的步数预算下**。必须记，因为它是一个会悄悄改变结论的
+        # 参数：实测把预算从 20 提到 30，三条难任务从 4/12 变成 10/12。
+        # 两份结果放一起比之前，先看清预算是不是同一档 —— 否则会把
+        # "预算不同"的差异读成"代码改动"的效果。和 `model` 字段是同一个道理。
+        "max_steps": max_steps or settings.max_steps,
         "elapsed": result.elapsed_seconds,
         "prompt_tokens": result.usage.prompt_tokens,
         "completion_tokens": result.usage.completion_tokens,
@@ -584,6 +589,12 @@ def print_report(
         f"{stats['counter_rate']:.1%}" if stats["counter_rate"] is not None else "—",
     )
     s.add_row("平均步数", str(stats["avg_steps"]))
+    # 把预算也印在汇总里。它是**会改变结论**的参数（20 → 30 让三条难任务
+    # 从 4/12 变 10/12），而汇总表是最常被复制进文档/简历的那一块 ——
+    # 不印在这里，数字离开上下文之后就没人知道它是哪一档跑出来的。
+    budgets = {r.get("max_steps") for r in scored if r.get("max_steps")}
+    if budgets:
+        s.add_row("步数预算", " / ".join(str(b) for b in sorted(budgets)))
     s.add_row("平均 token", str(stats["avg_tokens"]))
     s.add_row("平均成本", f"¥{stats['avg_cost_yuan']:.6f}")
     s.add_row("平均耗时", f"{stats['avg_elapsed']} 秒")
@@ -621,9 +632,12 @@ def main(argv: list[str] | None = None) -> int:
     settings.validate()
     # 打出来是为了**模型层消融**能对账：两份结果比之前先看清模型号，
     # 才不会把"换了模型"的差异误记成"改了代码"的效果。
+    # 步数预算同理 —— 它也会改变结论（见 run_task 里的说明），所以一起打在头部，
+    # 并写进明细文件的每一条记录。
+    effective_max_steps = args.max_steps or settings.max_steps
     console.print(
         f"[dim]模型 {settings.llm_model} ｜ 引擎 {settings.engine} "
-        f"｜ 任务集 {Path(args.task_file).name}[/dim]"
+        f"｜ 步数预算 {effective_max_steps} ｜ 任务集 {Path(args.task_file).name}[/dim]"
     )
 
     data = json.loads(Path(args.task_file).read_text(encoding="utf-8"))
@@ -675,7 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in tasks:
             console.print(f"[dim]→ {task['id']} {task['task'][:56]}[/dim]")
             try:
-                runs.append(asyncio.run(run_task(task, settings, args.max_steps)))
+                runs.append(asyncio.run(run_task(task, settings, effective_max_steps)))
             except KeyboardInterrupt:
                 console.print("[yellow]已中断[/yellow]")
                 break

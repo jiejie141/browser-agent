@@ -211,6 +211,18 @@ class StepRecord(BaseModel):
     message: str = ""
     url_after: str = ""
     screenshot_path: str = ""
+    # 这一步**感知到的页面**指纹（`agent.page_fingerprint`），以及此刻的停滞计数。
+    #
+    # 为什么要写进轨迹：停滞检测的判据是"页面有没有变"，可 trace 里原来只有
+    # 动作和结果、**没有页面**。这次排查一次真实失败就卡在这儿 ——
+    # 明明看见 Agent 在原地打转，却没有任何字段能回答"当时页面到底变没变"，
+    # 最后只能另写一个脚本把动作序列重放一遍才量出来（scripts/probe_replay_stall.py）。
+    # 把指纹落盘之后，这类问题直接读 trace 就有答案：相邻两行指纹相同 = 那一步没信息。
+    #
+    # 存 16 位短哈希而不是正文：正文动辄几千字，全部落盘会让 trace 膨胀几十倍；
+    # 而复盘要回答的是"变没变"，不是"变成了什么"（后者看 body_text 摘要即可）。
+    page_fp: str = ""
+    stall_count: int = 0
 
     @property
     def action_name(self) -> str:

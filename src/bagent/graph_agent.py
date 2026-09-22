@@ -47,14 +47,19 @@ from typing import Annotated, Awaitable, Callable, Literal, TypedDict
 import logging
 
 from .agent import (
+    CLOSING_MAX_STEPS,
     LOOP_STOP_AT,
     LOOP_WARN_AT,
     MAX_CONSECUTIVE_FAILURES,
+    STALL_STOP_AT,
+    STALL_WARN_AT,
     SYSTEM_PROMPT,
     RunResult,
     StepCallback,
     _action_signature,
     loop_counts,
+    page_fingerprint,
+    update_stall,
 )
 from .browser import BrowserSession
 from .config import Settings
@@ -131,6 +136,15 @@ class AgentState(TypedDict, total=False):
     sig_trail: list[str]
     consecutive_failures: int
     prefer_vision: bool
+    # 停滞检测（与手写引擎同一套规则，见 agent.py 的 page_fingerprint）。
+    # `last_action` 存上一步真正执行的动作，供本步判断"它有没有带来新信息"；
+    # 这几个字段必须在这里显式声明，否则 LangGraph 会在节点间丢掉它们 ——
+    # 和 grounding_retries 踩过的是同一个坑（未声明的键不保留）。
+    prev_fp: str
+    last_action: object
+    stall_count: int
+    closing: bool
+    closing_steps: int
     # 节点内部流转
     page_state: object
     action: object
@@ -235,7 +249,63 @@ class LangGraphReActAgent:
             run_dir=self._run_dir,
             prefer_vision=state.get("prefer_vision", False),
         )
-        return {"step": step, "page_state": st, "prefer_vision": False}
+
+        # ---------- 停滞检测：动作各异，但页面一字未变 ----------
+        # 与手写引擎共用同一批常量与函数（见 agent.py）。放在 perceive 节点
+        # 而不是 reason 节点，是为了让警告能进到**本轮**prompt —— 放到 act 之后
+        # 就要等到下一轮才生效，白白多烧一步。
+        #
+        # `last_action` 在这里**读出并清空**：它描述的是"上一步那个动作"，
+        # 一旦被本步消费就不该再留着，否则 finish 被退回这类没产生动作的路径
+        # 会让它变陈旧，把停滞计数记到错误的那一步头上。
+        pending = state.get("last_action")
+        cur_fp = page_fingerprint(st)
+        stall_count = update_stall(
+            state.get("prev_fp", ""),
+            cur_fp,
+            getattr(pending, "action", None),
+            state.get("stall_count", 0),
+        )
+
+        history = list(state.get("history") or [])
+        closing = state.get("closing", False)
+        closing_steps = state.get("closing_steps", 0)
+
+        if stall_count >= STALL_STOP_AT:
+            if not closing:
+                closing = True
+                history.append(
+                    f"⚠ 严重警告：页面已经连续 {stall_count} 步**一字未变** —— "
+                    f"继续操作不可能再得到任何新信息了。"
+                    f"你现在**必须立刻调用 finish**，把你已经确知的结论写进 answer。"
+                    f"如果结论是「这个页面上没有某某功能 / 无法完成」这类，"
+                    f"直接照实写出来即可，**不需要**为它找 evidence"
+                    f"（引擎对这类结论免检证据）。"
+                )
+        elif closing:
+            # 页面重新有了变化 → 动作生效了，退出收束。
+            # `closing_steps` 不在这里清零 —— 它数的是"模型拒答次数"，见 agent.py。
+            closing = False
+        elif stall_count >= STALL_WARN_AT:
+            history.append(
+                f"⚠ 警告：页面已经连续 {stall_count} 步没有任何变化，"
+                f"说明当前这个方向得不到新信息。"
+                f"请换一个明显不同的做法，或者直接调用 finish 给出你目前的结论。"
+            )
+
+        out: dict = {
+            "step": step,
+            "page_state": st,
+            "prefer_vision": False,
+            "last_action": None,
+            "prev_fp": cur_fp,
+            "stall_count": stall_count,
+            "closing": closing,
+            "closing_steps": closing_steps,
+        }
+        if len(history) != len(state.get("history") or []):
+            out["history"] = history[-12:]
+        return out
 
     async def _node_reason(self, state: AgentState) -> dict:
         st = state.get("page_state")
@@ -363,6 +433,46 @@ class LangGraphReActAgent:
                 "grounding_retries": retries,
             }
 
+        # --- 收束阶段：只接受结论，不接受"再试一下" ---
+        # 与手写引擎同一套规则。只喊话不够用：实测重放了 t06 的一次失败
+        # （runs/20260921-224847-t06），收束指令注入之后模型回手就是
+        # `extract` / `extract` / `click#1`，一直磨到步数上限。
+        # 所以这里**真的拦住**：非 finish 动作不执行，只回一条明确的拒绝，
+        # 拒绝累积到 CLOSING_MAX_STEPS 就熔断。数的是"模型拒答次数"。
+        if state.get("closing") and action.action != "finish":
+            stall = state.get("stall_count", 0)
+            steps = state.get("closing_steps", 0) + 1
+            message = (
+                f"收束阶段不接受 `{action.action}`：页面已连续 {stall} 步无变化，"
+                f"没有新信息可获取。现在**只剩 finish 一个选项**。"
+            )
+            records.append(
+                StepRecord(
+                    step=step, action=action, ok=False, message=message,
+                    url_after=st.url, page_fp=state.get("prev_fp", ""), stall_count=stall,
+                ).model_dump()
+            )
+            if self.on_step:
+                self.on_step(step, action, False, message)
+            out: dict = {
+                "records": records,
+                "closing_steps": steps,
+                "action": None,
+            }
+            if steps >= CLOSING_MAX_STEPS:
+                out["error"] = (
+                    f"页面连续 {stall} 步毫无变化（判定为原地打转），"
+                    f"收束后又连续 {steps} 次拒绝给出结论，熔断"
+                )
+            else:
+                out["history"] = _note(
+                    state,
+                    f"第 {step} 步: {message}"
+                    '请立刻输出 {"action": "finish", "answer": "..."} —— '
+                    "把你能确定的结论写进 answer 就够了。",
+                )
+            return out
+
         # --- extract：读正文，不碰浏览器 ---
         if action.action == "extract":
             outcome_ok, message = True, f"已读取页面正文（{len(st.body_text)} 字）"
@@ -377,6 +487,7 @@ class LangGraphReActAgent:
                 step=step, action=action, ok=outcome_ok, message=message,
                 url_after=session.page.url if session.page else "",
                 screenshot_path=st.screenshot_path,
+                page_fp=state.get("prev_fp", ""), stall_count=state.get("stall_count", 0),
             ).model_dump()
         )
         if self.on_step:
@@ -393,6 +504,11 @@ class LangGraphReActAgent:
             "records": records,
             "prefer_vision": prefer_vision,
             "consecutive_failures": 0 if outcome_ok else state.get("consecutive_failures", 0) + 1,
+            # 记下这一步的动作，供**下一步的 perceive 节点**判断它有没有带来新信息
+            # （停滞检测，见 _node_perceive）。只在真正执行了动作的路径上赋值，
+            # 所以 finish 被退回 / JSON 非法那两条提前 return 的路径不会污染它，
+            # 与手写引擎里 `last_action = action` 的位置一一对应。
+            "last_action": action,
             # 清掉已消费的动作。否则下一步若模型吐了非法 JSON，
             # reason 不会写 action，LangGraph 会沿用上一步的值 → 同一步被执行两次。
             "action": None,
@@ -401,22 +517,22 @@ class LangGraphReActAgent:
         # --- 动作指纹循环检测（与手写引擎同一套规则）---
         sig = _action_signature(action)
         trail = list(state.get("sig_trail") or []) + [sig]
-        # 与手写引擎共用 loop_counts：判据仍是"累计"，但数字要如实 ——
-        # 原来这里写"连续 N 次"，实际算的是 trail.count()，日志与事实不符。
-        # 详见 agent.py 里 loop_counts 的说明与实测轨迹。
+        # 与手写引擎共用 loop_counts。**判据是末尾连续次数，不是累计** ——
+        # 累计判据误杀过 t04（5 次 scroll 分散在第 4/6/11/12/14 步，
+        # 每一步之间都在获得新信息）。完整推导见 agent.py 主循环那一段。
         repeats, consecutive = loop_counts(trail, sig)
         out["sig_trail"] = trail
-        if repeats >= LOOP_STOP_AT:
+        if consecutive >= LOOP_STOP_AT:
             out["error"] = (
-                f"检测到原地打转：动作 {sig} 累计出现 {repeats} 次"
-                f"（其中末尾连续 {consecutive} 次）且无进展，已熔断"
+                f"检测到原地打转：动作 {sig} 已连续 {consecutive} 次"
+                f"（整轮累计出现 {repeats} 次）且无进展，已熔断"
             )
-        elif repeats >= LOOP_WARN_AT:
+        elif consecutive >= LOOP_WARN_AT:
             out["history"] = (
                 list(out["history"])
                 + [
-                    f"⚠ 严重警告：动作 `{sig}` 已经累计出现 {repeats} 次"
-                    f"（其中末尾连续 {consecutive} 次），"
+                    f"⚠ 严重警告：动作 `{sig}` 已经**连续**出现 {consecutive} 次"
+                    f"（整轮累计 {repeats} 次），"
                     f"页面没有任何进展。**禁止再执行这个动作**。"
                     f"你现在必须二选一：(a) 换一个完全不同的元素编号；"
                     f"(b) 直接调用 finish 给出结论。"
@@ -458,6 +574,13 @@ class LangGraphReActAgent:
                 "sig_trail": [],
                 "consecutive_failures": 0,
                 "prefer_vision": False,
+                # 停滞检测初值（见 _node_perceive）。空指纹代表"还没有上一帧可比"，
+                # update_stall 会原样返回计数 —— 第 1 步不可能判停滞。
+                "prev_fp": "",
+                "last_action": None,
+                "stall_count": 0,
+                "closing": False,
+                "closing_steps": 0,
                 "finished": False,
                 "answer": "",
                 "error": "",

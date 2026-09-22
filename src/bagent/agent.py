@@ -90,9 +90,50 @@ SYSTEM_PROMPT = """你是一个浏览器自动化 Agent。你的目标是通过�
 # 熔断阈值。**提升为模块级常量**，因为 LangGraph 引擎（graph_agent.py）
 # 必须用同一套阈值 —— 否则两个引擎的"什么时候停"不一致，A/B 对比就失去意义。
 # 原先这三个值是写在 run() 里的局部变量，跨引擎无法共享，属于隐性耦合。
-LOOP_WARN_AT = 3   # 第 3 次重复同一个动作 → 注入强警告
-LOOP_STOP_AT = 5   # 第 5 次 → 直接熔断，不再烧钱
+#
+# ⚠️ 这两个阈值按**连续**重复计，不是累计。这一条是被一次真实回归打出来的：
+# 把 scroll 的指纹合并成方向之后（堵住"换滚动量 = 换新动作"的绕过），
+# 累计判据立刻误杀了 t04 —— 它的 5 次 scroll 分散在第 4/6/11/12/14 步，
+# 每一步之间都在获得新信息（点结果、翻页、读正文），
+# 熔断日志却写着"末尾连续 1 次"。用累计去判定"原地打转"是错的。
+LOOP_WARN_AT = 3   # 连续 3 次同一个动作 → 注入强警告
+LOOP_STOP_AT = 5   # 连续 5 次 → 熔断
 MAX_CONSECUTIVE_FAILURES = 3
+
+# ---- 停滞检测（抓"动作各不相同、页面一字未变"）----
+# 为什么光有动作指纹不够：动作指纹只能看**行为重复**，看不见**有没有收获**。
+# 真实例子（强模型跑 t06）：20 步里 13 次 scroll，每次 dy 都不一样 ——
+# 指纹各异，熔断一次没触发，20 步全烧完任务还是没完成。
+# 判据应该是"这一步到底有没有得到新信息"，而那是**页面**的属性，不是动作的。
+STALL_WARN_AT = 3  # 连续 3 步页面状态一字未变 → 警告
+STALL_STOP_AT = 6  # 连续 6 步 → 进入"收束"（先逼一次结论，再熔断）
+
+# 收束阶段最多容忍模型**拒答几次**。
+#
+# ⚠️ 数的是"模型连续拒绝给结论的次数"，不是"引擎干等的步数"。
+# 第一版数的是步数：跪在阈值的那些步里，模型爱做什么做什么，引擎只负责数够
+# CLOSING_MAX_STEPS 就熔断。结果实测（重放 runs/20260921-224847-t06）——
+# 收束指令注入之后，模型回手就是 `extract` / `extract` / `click#1`，
+# 把指令当耳旁风。**只喊话、不拦动作，等于没管。**
+# 现在收束期间的任何非 finish 动作都**不执行**，直接回一条明确的拒绝，
+# 拒绝累积到这个数就熔断。语义更准：我们想知道的是"它到底肯不肯给结论"。
+#
+# **为什么不干脆替它写结论**：反例任务考的就是"识别并声明做不到"
+# （见 eval/run_eval.py 的 judge 第一条：熔断不算拒答）。
+# 引擎代写等于把判分口径改了 —— 那样数字会变好看，但它不再说明模型有能力。
+CLOSING_MAX_STEPS = 3
+
+# 哪些动作**本应改变页面**，因而参与停滞计数。
+#
+# 排除 `extract` / `screenshot`：它们是只读动作，本来就不改页面，
+# 拿它们算停滞是冤枉。
+#
+# ⚠️ `type` 也排除，理由是实测出来的假阳性来源：**输入框里敲的字
+# 不会出现在正文摘要里**（正文抽的是可见文本，读不到 input 的 value），
+# 所以"连续填 6 个输入框"这种完全正常的流程会被判成停滞。
+# 它在输入框上的原地打转由**动作指纹**那一套负责（t04 的 type#20 连打就是它抓的）——
+# 两套机制各管一半，故意留的互补，不是漏掉了。
+PROGRESS_ACTIONS = ("click", "goto", "press", "scroll")
 
 
 def _action_signature(action: Action) -> str:
@@ -108,15 +149,27 @@ def _action_signature(action: Action) -> str:
     20 步里 13 次 `scroll`，dy 依次是 -200 / -1000 / -500 / -2000 / -3000 /
     +2000 / -3000 / -5000 / -1000 / -10000 / -5000 …，**每个都不一样**，
     指纹各不相同，熔断一次都没触发 —— 20 步全部执行成功、无任何报错，
-    任务却仍然没完成。换成方向签名后熔断点 = 第 7 步（省下 13 步）。
+    任务却仍然没完成。
 
     **为什么按方向而不是具体像素**：反复滚动本身就是"没有进展"的形态，
     不需要靠"滚了多远"来区分；但"向下找内容 / 再向上回看"是合理动作，
     所以保留 down / up 的方向区分，只把幅度丢掉。
 
-    **这条改动的代价我量过**：拿 18 次基线重算，只有那 3 次**本来就熔断
-    失败**的运行会被命中，且熔断点完全相同（18 / 18 / 17）——
-    没有任何一次通过的运行受影响。
+    ⚠️ **这一刀是必要的，但它不够 —— 而且我当时给出的"代价评估"是错的。**
+
+    改完我立刻做了一次"离线复算"：拿 18 次基线重算，结论是
+    "只有那 3 次本来就熔断失败的运行会被命中（熔断点 18/18/17），
+    通过的运行一次都没受影响"。**这个结论无效，我现在把话收回。**
+
+    离线复算只能回答"**旧轨迹**会不会提前熔断"，回答不了
+    "警告改变了模型行为之后，它会走出一条什么样的**新轨迹**"。
+    拿一个不存在的未来去证明改动安全，是自欺。代价很快就到了：
+    真实基线里 t04 从 2/3 掉到 0/3 —— 累计判据把"分散但正常"的探索误杀了
+    （5 次 scroll 分散在第 4/6/11/12/14 步，中间都在获得新信息）。
+
+    最终收口靠两件事：判据从累计改成**连续**；
+    以及对"反复滚动"的判定从**动作**换到**页面**
+    （`page_fingerprint` / `update_stall`，见下面的停滞检测一节）。
     """
     if action.action in ("click", "type", "goto"):
         return f"{action.action}#{action.ref or action.url}"
@@ -161,6 +214,92 @@ def loop_counts(trail: list[str], sig: str) -> tuple[int, int]:
             break
         consecutive += 1
     return total, consecutive
+
+
+def page_fingerprint(state) -> str:
+    """把一帧页面压成一个短哈希 —— 回答"我到底有没有得到新信息？"
+
+    与动作指纹是**两套互补的判据**，别把它们当成一回事：
+
+    | 判据 | 抓什么 | 真实案例 |
+    |---|---|---|
+    | 动作指纹 | 同一个动作被**重复** | 7B t04：`type#20` 连打 |
+    | 页面指纹 | 动作各不相同，但页面**一字未变** | 强模型 t06：13 次 scroll，每次 dy 都不同 |
+
+    后者是纯行为统计抓不到的：动作每次都"新"，可收获始终是零。
+
+    ## 指纹里**只放"能读到的信息"**：url + title + 正文
+
+    ⚠️ 元素清单**必须剔除**，这一条是量出来的，不是想出来的：
+
+    我原先把"元素清单（DOM 顺序 + tag + text）"也算进指纹，直觉是
+    "页面结构变了 = 有新信息"。用真浏览器量了一遍
+    （`scripts/probe_page_fp.py`，books.toscrape.com 连滑 4 次再连滑 4 次）：
+
+    ```
+    动作            指纹              元素数   正文长
+    goto            533ea144404caad5     85     2029
+    scroll +500     533ea144404caad5     85     2029
+    scroll +500     56f43498c80d1490     85     2029
+    scroll +500     1aaa2f57c2b72731     77     2029
+    scroll +500     34d279a4bc2bcffd     71     2029
+    scroll -500     b12911403fe18644     85     2029
+    scroll -500     533ea144404caad5     85     2029   ← 滑回原位，指纹原样回来了
+    ```
+
+    **正文长度全程 2029 一字未变**，变的是元素数（85 → 77 → 71 → 85）。
+    原因是感知层采集元素时带**视口过滤**（`r.bottom < -800` 才丢弃，
+    见 perception.py 的 `visible`），滚动会让页面顶部的元素掉出采集范围。
+
+    也就是说：这个抖动**纯粹是"我站在哪儿看"，不是"页面上多了什么"**。
+    带着它做停滞检测，后果是"滚动打转"这一类**恰好检测不到**
+    （每次滑指纹都变，计数器永远清零）—— 而那正是这个机制要抓的主要形态。
+    一个在自己目标场景上失灵的判据，比没有更糟：它会让日志显得"检查过了"。
+
+    剔除元素清单之后，"有没有新信息"就等价于"正文/标题/网址有没有变"，
+    而正文恰好是模型能读出答案的唯一来源 —— 口径自洽。
+
+    ⚠️ 也不含 `screenshot_path`：那是一次性的临时文件名，跟页面内容无关。
+
+    ## 已知局限（写出来，别假装没有）
+
+    `perceive` 在元素解析为空时会截图，配了视觉模型的话会把一段**描述**并进
+    `body_text`（见 perception.py 的 `prefer_vision` 分支）。那段描述每帧措辞
+    未必相同，于是指纹会一直变 —— **在 Canvas / iframe 那类页面上，停滞检测
+    会被视觉通道的描述差异"喂"成永远有进展**。
+
+    没有为它做特殊处理，理由有两条：一是那种页面上"描述确实变了"未必是假象；
+    二是要压掉它就得把正文和视觉描述分开存，那是感知层的接口改动，
+    应该和"视觉通道到底有多少收益"一起评估，不该塞在这次的修复里悄悄做掉。
+    记在这里，等它真的成为瓶颈再动。
+    """
+    import hashlib
+
+    parts = [
+        state.url or "",
+        state.title or "",
+        state.body_text or "",
+    ]
+    joined = "\n".join(parts)
+    return hashlib.sha1(joined.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def update_stall(prev_fp: str, cur_fp: str, action_name: str | None, count: int) -> int:
+    """更新"连续无新信息"的计数，返回新的计数值。
+
+    只对 `PROGRESS_ACTIONS` 里的动作计数（见该常量的说明）。判定很直白：
+
+    - 动作不属于"本应改变页面"的一类（type/extract/screenshot/finish/None）
+      → 不计，也不算进展，原样返回；
+    - 手上还没有上一帧指纹（第 1 步）→ 无从比较，原样返回；
+    - 页面指纹变了 → **有进展，清零**；
+    - 页面指纹一样 → 计 +1。
+    """
+    if action_name not in PROGRESS_ACTIONS:
+        return count
+    if not prev_fp or not cur_fp:
+        return count
+    return 0 if cur_fp != prev_fp else count + 1
 
 
 @dataclass
@@ -236,6 +375,17 @@ class ReActAgent:
         # 只是毫无进展。这是 7B 级别模型最典型的失效方式。
         sig_trail: list[str] = []
 
+        # ---- 停滞检测（页面指纹）状态 ----
+        # prev_fp 是**上一帧**页面指纹；注意它与 last_action 是配对使用的：
+        # 第 N 步顶部比较的是「第 N-1 步的页面」与「第 N 步的页面」，
+        # 反映的正是**第 N-1 步那个动作**有没有带来新信息，所以传的是
+        # `pending_action`（上一步的动作），不是本步的。
+        prev_fp = ""
+        last_action: Action | None = None
+        stall_count = 0
+        closing = False        # 是否已进入"收束"（逼结论）阶段
+        closing_steps = 0
+
         for step in range(1, max_steps + 1):
             # ---------- 看（Observe）----------
             state = await perceive(
@@ -246,6 +396,41 @@ class ReActAgent:
                 prefer_vision=prefer_vision,
             )
             prefer_vision = False
+
+            # ---------- 停滞检测：这一步到底有没有得到新信息？----------
+            # 放在"想（Reason）"**之前**，是为了让下面的警告进到本轮 prompt 里 ——
+            # 放到 action 之后再判，警告就要等到下一轮才生效，白白多烧一步。
+            pending_action, last_action = last_action, None
+            cur_fp = page_fingerprint(state)
+            stall_count = update_stall(
+                prev_fp, cur_fp,
+                pending_action.action if pending_action else None,
+                stall_count,
+            )
+            prev_fp = cur_fp
+
+            if stall_count >= STALL_STOP_AT:
+                if not closing:
+                    # 首次触顶：进入收束，并注入一次强指令。
+                    closing = True
+                    history.append(
+                        f"⚠ 严重警告：页面已经连续 {stall_count} 步**一字未变** —— "
+                        f"继续操作不可能再得到任何新信息了。"
+                        f"你现在**必须立刻调用 finish**，把你已经确知的结论写进 answer。"
+                        f"如果结论是「这个页面上没有某某功能 / 无法完成」这类，"
+                        f"直接照实写出来即可，**不需要**为它找 evidence"
+                        f"（引擎对这类结论免检证据）。"
+                    )
+            elif closing:
+                # 页面重新有了变化 → 说明动作生效了，退出收束，恢复正常节奏。
+                # 注意 `closing_steps` 不在这里清零 —— 见下面"收束预算"的说明。
+                closing = False
+            elif stall_count >= STALL_WARN_AT:
+                history.append(
+                    f"⚠ 警告：页面已经连续 {stall_count} 步没有任何变化，"
+                    f"说明当前这个方向得不到新信息。"
+                    f"请换一个明显不同的做法，或者直接调用 finish 给出你目前的结论。"
+                )
 
             # ---------- 想（Reason）----------
             user_prompt = self._build_prompt(task, state, history)
@@ -284,6 +469,8 @@ class ReActAgent:
                         message=f"模型输出不是合法 JSON：{parse_err}",
                         url_after=state.url,
                         screenshot_path=state.screenshot_path,
+                        page_fp=cur_fp,
+                        stall_count=stall_count,
                     )
                 )
                 if self.on_step:
@@ -309,6 +496,7 @@ class ReActAgent:
                         StepRecord(
                             step=step, action=action, ok=False, message=message,
                             url_after=state.url, screenshot_path=state.screenshot_path,
+                            page_fp=cur_fp, stall_count=stall_count,
                         )
                     )
                     if self.on_step:
@@ -338,11 +526,54 @@ class ReActAgent:
                         step=step, action=action, ok=True,
                         message="任务结束" + ("（证据已核对）" if grounded else f"（{note}）"),
                         url_after=state.url,
+                        page_fp=cur_fp, stall_count=stall_count,
                     )
                 )
                 if self.on_step:
                     self.on_step(step, action, True, "任务结束（证据已核对）" if grounded else "任务结束")
                 break
+
+            # ---------- 收束阶段：只接受结论，不接受"再试一下" ----------
+            # 只喊话是不够的 —— 实测（把 runs/20260921-224847-t06 的动作序列
+            # 重放一遍）：收束指令在第 14 步注入，模型回手就是
+            # `extract` / `extract` / `click#1`，把指令当耳旁风，一直磨到 20 步上限。
+            # 所以这里**真的拦住它**：收束期间的任何非 finish 动作都不执行，
+            # 只回一条明确的拒绝。
+            #
+            # 这样"预算"数的就是**模型拒答的次数**，而不是引擎干等的步数 ——
+            # 语义更准：我们真正想知道的是"它到底肯不肯给结论"。
+            #
+            # 为什么不干脆替它写结论：反例任务考的就是"识别并声明做不到"
+            # （见 eval/run_eval.py 的 judge 第一条），引擎代写等于把判分口径改了。
+            # 这里只能把"必须表态"变成硬约束，不能把结论变成引擎的产物。
+            if closing and action.action != "finish":
+                closing_steps += 1
+                message = (
+                    f"收束阶段不接受 `{action.action}`：页面已连续 {stall_count} 步无变化，"
+                    f"没有新信息可获取。现在**只剩 finish 一个选项**。"
+                )
+                records.append(
+                    StepRecord(
+                        step=step, action=action, ok=False, message=message,
+                        url_after=state.url, screenshot_path=state.screenshot_path,
+                        page_fp=cur_fp, stall_count=stall_count,
+                    )
+                )
+                if self.on_step:
+                    self.on_step(step, action, False, message)
+                if closing_steps >= CLOSING_MAX_STEPS:
+                    error = (
+                        f"页面连续 {stall_count} 步毫无变化（判定为原地打转），"
+                        f"收束后又连续 {closing_steps} 次拒绝给出结论，熔断"
+                    )
+                    break
+                history.append(
+                    f"第 {step} 步: {message}"
+                    '请立刻输出 {"action": "finish", "answer": "..."} —— '
+                    "把你能确定的结论写进 answer 就够了。"
+                )
+                history = history[-12:]
+                continue
 
             if action.action == "extract":
                 outcome_ok, message = True, f"已读取页面正文（{len(state.body_text)} 字）"
@@ -358,12 +589,18 @@ class ReActAgent:
                     step=step, action=action, ok=outcome_ok, message=message,
                     url_after=session.page.url if session.page else "",
                     screenshot_path=state.screenshot_path,
+                    page_fp=cur_fp, stall_count=stall_count,
                 )
             )
             if self.on_step:
                 self.on_step(step, action, outcome_ok, message)
 
             # ---------- 记录 ----------
+            # 记下这一步的动作，供**下一步顶部**的停滞检测判断"它有没有带来新信息"。
+            # 只在这里赋值（而不是在循环开头），是为了让 `continue` 出去的路径
+            # （finish 被退回、JSON 非法）天然留下 None —— 那些情况没有产生
+            # 可归因的动作，停滞计数就该原样不动，不能冤枉也别白送进展。
+            last_action = action
             status = "成功" if outcome_ok else "失败"
             desc = f"第 {step} 步: {self._describe(action)} → {status}: {message}"
             if not outcome_ok:
@@ -377,22 +614,29 @@ class ReActAgent:
                 break
 
             # ---------- 循环检测 ----------
+            # ⚠️ 判据是**末尾连续**次数，不是累计。这一条是被一次真实回归打出来的：
+            # 把 scroll 指纹合并成方向之后，累计判据立刻误杀了 t04 ——
+            # 它的 5 次 scroll 分散在第 4/6/11/12/14 步，每一步之间都在获得新信息
+            # （点结果、翻页、读正文），旧日志却写着"末尾连续 1 次"。
+            # 用累计去判定"原地打转"是错的：原地打转的定义是"没有新信息"，
+            # 而那是**页面**的属性 —— 由上面的停滞检测负责；
+            # 这里这一套只管"同一个动作真的连着重复"这件事。
             sig = _action_signature(action)
             sig_trail.append(sig)
             repeats, consecutive = loop_counts(sig_trail, sig)
-            if repeats >= LOOP_STOP_AT:
+            if consecutive >= LOOP_STOP_AT:
                 error = (
-                    f"检测到原地打转：动作 {sig} 累计出现 {repeats} 次"
-                    f"（其中末尾连续 {consecutive} 次）且无进展，已熔断"
+                    f"检测到原地打转：动作 {sig} 已连续 {consecutive} 次"
+                    f"（整轮累计出现 {repeats} 次）且无进展，已熔断"
                 )
                 break
-            if repeats >= LOOP_WARN_AT:
+            if consecutive >= LOOP_WARN_AT:
                 # 把警告写回历史，下一轮模型一定会看到。
                 # 注意措辞是"禁止"而不是"建议"——小模型对强约束才有反应。
-                # 数字必须如实：判据是**累计**，就不能写成"连续"（见 loop_counts）。
+                # 数字必须如实：判据是**末尾连续**，就不能写成"累计"（见 loop_counts）。
                 history.append(
-                    f"⚠ 严重警告：动作 `{sig}` 已经累计出现 {repeats} 次"
-                    f"（其中末尾连续 {consecutive} 次），"
+                    f"⚠ 严重警告：动作 `{sig}` 已经**连续**出现 {consecutive} 次"
+                    f"（整轮累计 {repeats} 次），"
                     f"页面没有任何进展。**禁止再执行这个动作**。"
                     f"你现在必须二选一：(a) 换一个完全不同的元素编号；(b) 直接调用 finish "
                     f"给出结论。如果你已经能从页面正文里看到答案，请立刻 finish。"

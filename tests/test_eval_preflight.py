@@ -48,6 +48,10 @@ class _SettingsStub:
     # main() 会打印生效的模型/引擎（模型层消融要对账），桩得带上这两个字段。
     llm_model = "stub-model"
     engine = "handwritten"
+    # 步数预算也是"会改变结论的参数"（20 → 30 让三条难任务从 4/12 变 10/12），
+    # 所以 main() 也把它打进头部和明细。桩同样要带上 —— 规则是：
+    # **main() 读什么，桩就得有什么**，否则一改 main() 就红在这两条无关的用例上。
+    max_steps = 30
 
 
 @pytest.fixture
